@@ -37,4 +37,4 @@ df_2017_2024.columns = [
     "Fatalities", "Injuries", "Property_Loss"
 ]
 
-print(df_2017_2024.shape)
+df_2017_2024.to_csv("tornades_2017_2024.csv", index=True)
