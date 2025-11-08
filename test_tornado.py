@@ -1,7 +1,7 @@
 import pandas as pd
 
 # Charger les données
-path = r"Tornadotracks\Tornado_Tracks_1950_2017_1_7964592706304725094.csv"
+path = "tornadoTracks\Tornado_Tracks_1950_2017_1_7964592706304725094.csv"
 df_tornado = pd.read_csv(path)
 
 # Convertir Date en datetime
@@ -37,9 +37,4 @@ df_2017_2024.columns = [
     "Fatalities", "Injuries", "Property_Loss"
 ]
 
-print(f"Total tornades (2017-2024): {len(df_2017_2024)}")
-print(f"\nPar année :")
-print(df_2017_2024['Year'].value_counts().sort_index())
-
-
-
+print(df_2017_2024.shape)
