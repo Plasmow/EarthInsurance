@@ -66,6 +66,7 @@ CSV schema: `lat, lon, time_utc, f1..f64` (+ `label_occ` for probability, `label
 - `Backend/risk_inference.py`: Loads XGBoost models, builds geo/time features, and returns probability and EF magnitude predictions.
 - `Backend/tornado_probability.py`: Trains the tornado occurrence classifier and saves the model/metadata (CLI usage).
 - `Backend/tornado_damage.py`: Trains the EF magnitude classifier and saves the model/metadata (CLI usage).
+- `Backend/tornado_loss.py`: Computes a unitless risk score R = p * v(EF) using a simple MDR table by occupancy (residential/commercial/industrial); includes a small CLI for single‑point scoring.
 - `Backend/generate_features_from_events.py`: Generates positives/negatives from `events.csv` and samples AlphaEarth embeddings via GEE (exports to Drive/GCS/local).
 - `Backend/generate_features_from_events_nopandas.py`: Minimal no‑pandas generator that writes `features.csv` (~40% positives) for quick tests.
 - `Backend/model.py`: Earth Engine example that fetches a 64‑dim AlphaEarth embedding at a given point.
