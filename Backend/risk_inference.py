@@ -31,23 +31,38 @@ from xgboost import XGBClassifier, XGBRegressor
 import xgboost as xgb
 
 EMBEDDING_DIM = 64
-STRICT_FORMAT = "%Y-%m-%d %H:%M:%S%z"
+STRICT_FORMAT = "%Y-%m-%d %H:%M:%S%z"  # kept for backward compat (space variant)
 
 
 def _parse_time_strict(s: Union[str, datetime]) -> datetime:
+    """Parse UTC-aware timestamp to naive UTC datetime.
+
+    Accepts:
+      - 'YYYY-MM-DD HH:MM:SS+HH:MM'
+      - 'YYYY-MM-DDTHH:MM:SS+HH:MM'
+      - same with trailing 'Z' meaning UTC
+    """
     if isinstance(s, datetime):
         return s.astimezone(timezone.utc).replace(tzinfo=None) if s.tzinfo else s
     raw = str(s).strip()
     if not raw:
         raise ValueError("Empty time string")
-    try:
-        dt = datetime.strptime(raw, STRICT_FORMAT)
-    except ValueError as exc:
-        if raw.endswith('Z'):
-            dt = datetime.strptime(raw[:-1] + '+00:00', STRICT_FORMAT)
-        else:
-            raise ValueError(f"Expected 'YYYY-MM-DD HH:MM:SS+HH:MM', got '{s}'") from exc
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    norm = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    patterns = [
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+    ]
+    last_exc = None
+    for p in patterns:
+        try:
+            dt = datetime.strptime(norm, p)
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        except ValueError as exc:
+            last_exc = exc
+            continue
+    raise ValueError(
+        f"Expected one of ['YYYY-MM-DD HH:MM:SS+HH:MM', 'YYYY-MM-DDTHH:MM:SS+HH:MM', '...Z'], got '{s}'"
+    ) from last_exc
 
 
 def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, float]:
@@ -86,10 +101,25 @@ _magn_cache = None    # (model, feature_names, class_labels, model_type)
 
 
 def _resolve_dir(model_dir: str) -> str:
+    """Resolve a model directory relative to this file, with parent fallback.
+
+    Priority:
+      1) <this_dir>/<model_dir>
+      2) <this_dir>/../<model_dir>  (repo-level models_* when running from Backend/)
+    """
+    base_dir = Path(__file__).resolve().parent
+    candidates = []
     p = Path(model_dir)
-    if not p.is_absolute():
-        p = Path(__file__).resolve().parent / p
-    return str(p)
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.append(base_dir / p)
+        candidates.append(base_dir.parent / p)
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    # fallback to first candidate even if missing (will surface clearer error later)
+    return str(candidates[0])
 
 
 def _load_prob(model_dir: str = "models_prob"):
@@ -111,24 +141,46 @@ def _load_magnitude(model_dir: str = "models_damage"):
     global _magn_cache
     if _magn_cache is not None:
         return _magn_cache
-    base = _resolve_dir(model_dir)
-    meta_path = os.path.join(base, "preprocess.json")
-    cls_path = os.path.join(base, "tornado_magnitude_cls_xgb.json")
-    reg_path = os.path.join(base, "tornado_magnitude_xgb.json")  # legacy regression
+    base_dir = Path(__file__).resolve().parent
+    repo_dir = base_dir.parent
+    candidates = [
+        base_dir / model_dir,           # Backend/models_damage
+        repo_dir / model_dir,           # repo-level models_damage
+    ]
+    # Resolve meta and model paths for both locations
+    locations = []
+    for b in candidates:
+        b = b.resolve()
+        meta = b / "preprocess.json"
+        cls = b / "tornado_magnitude_cls_xgb.json"
+        reg = b / "tornado_magnitude_xgb.json"
+        locations.append((b, meta, cls, reg))
+    # Prefer classifier if present in any location; else use first available regressor
+    chosen = None
+    for b, meta, cls, reg in locations:
+        if cls.exists():
+            chosen = (b, meta, cls, "cls")
+            break
+    if chosen is None:
+        for b, meta, cls, reg in locations:
+            if reg.exists():
+                chosen = (b, meta, reg, "reg")
+                break
+    if chosen is None:
+        raise FileNotFoundError("No magnitude model found (expected classifier or legacy regressor)")
+    base, meta_path, model_path, mtype = chosen
     if not os.path.exists(meta_path):
         raise FileNotFoundError("Missing preprocess.json for magnitude model")
-    with open(meta_path, "r", encoding="utf-8") as f:
+    with open(str(meta_path), "r", encoding="utf-8") as f:
         meta = json.load(f)
     feature_names = meta.get("feature_names")
     class_labels = meta.get("class_labels", [0,1,2,3,4,5])
-    if os.path.exists(cls_path):
-        model = XGBClassifier(); model.load_model(cls_path)
+    if mtype == "cls":
+        model = XGBClassifier(); model.load_model(str(model_path))
         _magn_cache = (model, feature_names, class_labels, "cls")
-    elif os.path.exists(reg_path):
-        model = XGBRegressor(); model.load_model(reg_path)
-        _magn_cache = (model, feature_names, class_labels, "reg")
     else:
-        raise FileNotFoundError("No magnitude model found (expected classifier or legacy regressor)")
+        model = XGBRegressor(); model.load_model(str(model_path))
+        _magn_cache = (model, feature_names, class_labels, "reg")
     return _magn_cache
 
 
@@ -183,14 +235,18 @@ def predict_damage(
             probs = np.asarray(model.predict_proba(X))[0]
         probs = probs / probs.sum() if probs.sum() > 0 else probs
         return {"magnitude_probs": [float(p) for p in probs.tolist()]}
-    # legacy regression fallback
+    # legacy regression fallback -> smooth probabilistic distribution around predicted magnitude
     try:
         booster = model.get_booster(); mag_val = float(np.asarray(booster.predict(xgb.DMatrix(X))).ravel()[0])
     except Exception:
         mag_val = float(np.asarray(model.predict(X)).ravel()[0])
-    mag_cls = int(np.clip(round(mag_val), 0, len(class_labels)-1))
-    one_hot = [0.0]*len(class_labels); one_hot[mag_cls] = 1.0
-    return {"magnitude_probs": one_hot, "magnitude": float(mag_cls)}
+    # Gaussian smoothing across discrete classes
+    k = np.arange(len(class_labels), dtype=float)
+    sigma = 0.85  # spread; tune if needed
+    weights = np.exp(-0.5 * ((k - mag_val) / max(sigma, 1e-6))**2)
+    probs = weights / weights.sum() if weights.sum() > 0 else weights
+    mag_cls = int(np.clip(np.argmax(probs), 0, len(class_labels)-1))
+    return {"magnitude_probs": [float(p) for p in probs.tolist()], "magnitude": float(mag_cls)}
 
 
 def predict_all(
@@ -219,37 +275,9 @@ def predict_all(
 # No module-level test execution; import-only module.
 #exemple: 
 
-def test_few_examples():
-    for i in range(100):
-        embedding = np.random.rand(64).tolist()
-        lat = np.random.uniform(-90.0, 90.0)
-        lon = np.random.uniform(-180.0, 180.0)
-        time_utc = "2025-05-02 14:30:00+00:00"
-        prob = predict_probability(embedding, lat, lon, time_utc)
-        damage = predict_damage(embedding, lat, lon, time_utc)
-        all_res = predict_all(embedding, lat, lon, time_utc)
-        assert 0.0 <= prob <= 1.0
-        assert "magnitude_probs" in damage
-        assert "magnitude" in all_res or "magnitude_probs" in all_res
-        magnitude= all_res.get("magnitude")
-        if magnitude!=0:
-            print(f"Example {i+1}: prob={prob:.4f}, damage={damage}, all={all_res}")
-        
-test_few_examples()
-        
-    
-data_example= {
-    "embedding": [0.1]*64, 
-    "lat": 40.43685,
-    "lon": -90.195,
-    "time_utc": "2025-05-02 14:30:00+00:00",
-}
-
-result = predict_all(    
-    embedding=data_example["embedding"],
-    lat=data_example["lat"],
-    lon=data_example["lon"],
-    time_utc=data_example["time_utc"],
-)
-
-print(result)
+# Removed automatic execution of random test examples and sample prediction;
+# keep a lightweight manual test helper callable by user code if desired.
+def manual_example():  # pragma: no cover (optional helper)
+    embedding = [0.1] * 64
+    res = predict_all(embedding, 40.43685, -90.195, "2025-05-02T14:30:00Z")
+    print(res)

@@ -8,7 +8,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score
 from xgboost import XGBClassifier
 
-# Schema attendu: lat, lon, time_utc, f1..f64, label_occ, label_int_f, label_int_wind_ms
+# Schema attendu: lat, lon, time_utc, f1..f64, label
 
 EMBEDDING_DIM = 64
 EMBED_COLS = [f"f{i}" for i in range(1, EMBEDDING_DIM + 1)]
@@ -16,22 +16,38 @@ EMBED_COLS = [f"f{i}" for i in range(1, EMBEDDING_DIM + 1)]
 
 def _parse_time_strict(s: Union[str, datetime]) -> datetime:
     """
-    Parse strictly the format 'YYYY-MM-DD HH:MM:SS+HH:MM', convert to naive UTC.
+    Parse a strict UTC-aware timestamp and return a naive UTC datetime.
+
+    Accepted formats:
+      - 'YYYY-MM-DD HH:MM:SS+HH:MM' (space)
+      - 'YYYY-MM-DDTHH:MM:SS+HH:MM' (ISO-8601 with 'T')
+      - 'YYYY-MM-DD HH:MM:SSZ' or 'YYYY-MM-DDTHH:MM:SSZ' (Z = UTC)
     """
     if isinstance(s, datetime):
         return s.astimezone(timezone.utc).replace(tzinfo=None) if s.tzinfo else s
     raw = str(s).strip()
     if not raw:
         raise ValueError("Empty time string")
-    try:
-        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S%z")
-    except ValueError as exc:
-        # Accept trailing 'Z' as UTC shortcut
-        if raw.endswith('Z'):
-            dt = datetime.strptime(raw[:-1] + "+00:00", "%Y-%m-%d %H:%M:%S%z")
-        else:
-            raise ValueError(f"Expected 'YYYY-MM-DD HH:MM:SS+HH:MM', got '{s}'") from exc
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    # Normalize trailing Z to +00:00 (UTC)
+    norm = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+
+    # Try multiple strict patterns
+    patterns = [
+        "%Y-%m-%d %H:%M:%S%z",   # space
+        "%Y-%m-%dT%H:%M:%S%z",   # ISO T
+    ]
+    last_exc = None
+    for p in patterns:
+        try:
+            dt = datetime.strptime(norm, p)
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        except ValueError as exc:
+            last_exc = exc
+            continue
+    raise ValueError(
+        f"Expected one of ['YYYY-MM-DD HH:MM:SS+HH:MM', 'YYYY-MM-DDTHH:MM:SS+HH:MM', '...Z'], got '{s}'"
+    ) from last_exc
 
 
 def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, float]:
@@ -50,12 +66,10 @@ def _validate_columns(df: pd.DataFrame) -> None:
     Vérifie la présence des colonnes minimales.
 
     Colonnes requises pour le modèle de probabilité:
-      - lat, lon, time_utc, f1..f64, label_occ
+      - lat, lon, time_utc, f1..f64, label
 
-    Colonnes facultatives ignorées ou utilisées si présentes:
-      - label_ef (peut servir au pondération de sévérité)
     """
-    required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_occ"]
+    required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Colonnes manquantes: {missing}")
@@ -88,8 +102,8 @@ def _load_train_test(train_csv: str, test_csv: str):
     _validate_columns(test_df)
     X_train, feature_names = _build_X(train_df)
     X_test, _ = _build_X(test_df)
-    y_train = train_df["label_occ"].astype(int)
-    y_test = test_df["label_occ"].astype(int)
+    y_train = train_df["label"].astype(int)
+    y_test = test_df["label"].astype(int)
     return X_train, y_train, X_test, y_test, feature_names
 
 
@@ -236,3 +250,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

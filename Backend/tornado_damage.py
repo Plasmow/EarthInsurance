@@ -18,21 +18,34 @@ EMBED_COLS = [f"f{i}" for i in range(1, EMBEDDING_DIM + 1)]
 
 def _parse_time_strict(s: Union[str, datetime]) -> datetime:
     """
-    Parse strictly the format 'YYYY-MM-DD HH:MM:SS+HH:MM', convert to naive UTC.
+    Parse a strict UTC-aware timestamp and return a naive UTC datetime.
+
+    Accepted formats:
+      - 'YYYY-MM-DD HH:MM:SS+HH:MM' (space)
+      - 'YYYY-MM-DDTHH:MM:SS+HH:MM' (ISO-8601 with 'T')
+      - 'YYYY-MM-DD HH:MM:SSZ' or 'YYYY-MM-DDTHH:MM:SSZ' (Z = UTC)
     """
     if isinstance(s, datetime):
         return s.astimezone(timezone.utc).replace(tzinfo=None) if s.tzinfo else s
     raw = str(s).strip()
     if not raw:
         raise ValueError("Empty time string")
-    try:
-        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S%z")
-    except ValueError as exc:
-        if raw.endswith('Z'):
-            dt = datetime.strptime(raw[:-1] + "+00:00", "%Y-%m-%d %H:%M:%S%z")
-        else:
-            raise ValueError(f"Expected 'YYYY-MM-DD HH:MM:SS+HH:MM', got '{s}'") from exc
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    norm = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    patterns = [
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+    ]
+    last_exc = None
+    for p in patterns:
+        try:
+            dt = datetime.strptime(norm, p)
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        except ValueError as exc:
+            last_exc = exc
+            continue
+    raise ValueError(
+        f"Expected one of ['YYYY-MM-DD HH:MM:SS+HH:MM', 'YYYY-MM-DDTHH:MM:SS+HH:MM', '...Z'], got '{s}'"
+    ) from last_exc
 
 
 def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, float]:
@@ -112,7 +125,7 @@ def train_damage(
         raise ValueError("Need at least 2 classes present in training labels for multiclass.")
 
     # Compute class frequencies for weighting (inverse frequency, normalized)
-    classes = present_classes
+    classes = np.array([0,1,2,3,4,5])
     freq = np.array([(y_tr == c).sum() for c in classes], dtype=float)
     # Avoid division by zero; if class absent set minimal frequency
     freq = np.where(freq==0, 1e-6, freq)
@@ -120,6 +133,11 @@ def train_damage(
     class_weights = inv / inv.sum() * len(classes)  # scaled so average weight ~1
     cw_map = {c: class_weights[i] for i,c in enumerate(classes)}
     sample_weight = np.array([cw_map[v] for v in y_tr], dtype=float)
+    
+    
+    
+    
+    
 
     clf = XGBClassifier(
         n_estimators=5000,
