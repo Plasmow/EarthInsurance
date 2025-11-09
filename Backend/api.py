@@ -9,6 +9,43 @@ CORS(app)
 from risk_inference import predict_damage, predict_probability
 
 # ==============================================================================
+# UTILITAIRES DE CONVERSION DE TEMPS
+# ==============================================================================
+
+def convert_to_expected_format(time_str):
+    """
+    Convertit un timestamp ISO 8601 au format attendu par les modèles ML.
+    Format attendu: 'YYYY-MM-DD HH:MM:SS+HH:MM'
+    Format reçu: '2025-11-09T12:58:57.841038' ou '2025-11-09T12:58:57'
+    """
+    try:
+        # Parser le timestamp ISO
+        if 'T' in time_str:
+            # Retirer les microsecondes si présentes
+            if '.' in time_str:
+                time_str = time_str.split('.')[0]
+            
+            # Parser la date
+            dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+        else:
+            # Si déjà au bon format ou format personnalisé
+            dt = datetime.strptime(time_str.split('+')[0].split('-')[0:3][0] + '-' + 
+                                  time_str.split('+')[0].split('-')[1] + '-' + 
+                                  time_str.split('+')[0].split('-')[2].split(' ')[0] + ' ' +
+                                  time_str.split(' ')[1].split('+')[0], 
+                                  '%Y-%m-%d %H:%M:%S')
+        
+        # Convertir au format attendu: 'YYYY-MM-DD HH:MM:SS+00:00'
+        formatted_time = dt.strftime('%Y-%m-%d %H:%M:%S+00:00')
+        return formatted_time
+    
+    except Exception as e:
+        print(f"Erreur lors de la conversion du timestamp: {e}")
+        # Fallback: retourner le timestamp actuel au bon format
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
+
+
+# ==============================================================================
 # CALCUL DE RISQUE AVEC ML
 # ==============================================================================
 
@@ -66,9 +103,12 @@ def calculate_risk_from_ml_models(latitude, longitude, time_utc=None):
     - magnitude_probs: distribution de probabilité sur les magnitudes
     - damage: estimation des dégâts (tornado_magnitude)
     """
-    # Si pas de timestamp fourni, utiliser maintenant
+    # Si pas de timestamp fourni, utiliser maintenant au bon format
     if time_utc is None:
-        time_utc = datetime.now().isoformat()
+        time_utc = datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
+    else:
+        # Convertir le timestamp au format attendu
+        time_utc = convert_to_expected_format(time_utc)
     
     # Générer l'embedding
     embedding = generate_embedding(latitude, longitude, time_utc)
@@ -174,7 +214,7 @@ def calculate_risk():
             'ef_label': ml_result['ef_label'],
             'latitude': latitude,
             'longitude': longitude,
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00'),
             'model_info': 'ML-based tornado risk prediction using AlphaEarth embeddings',
         }), 200
     
@@ -307,8 +347,11 @@ def predict_detailed():
         if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
             return jsonify({'error': 'Coordonnées invalides'}), 400
         
+        # Convertir le timestamp au bon format si fourni
         if time_utc is None:
-            time_utc = datetime.now().isoformat()
+            time_utc = datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
+        else:
+            time_utc = convert_to_expected_format(time_utc)
         
         # Générer l'embedding
         embedding = generate_embedding(latitude, longitude, time_utc)
@@ -331,6 +374,8 @@ def predict_detailed():
         )
         
         # Résultat complet
+        ml_result = calculate_risk_from_ml_models(latitude, longitude, time_utc)
+        
         return jsonify({
             'location': {
                 'latitude': latitude,
@@ -347,8 +392,8 @@ def predict_detailed():
                 'tornado_magnitude': float(damage_result.get('tornado_magnitude', 0.0)),
             },
             'combined_risk': {
-                'risk_score': calculate_risk_from_ml_models(latitude, longitude, time_utc)['risk_score'],
-                'risk_level': get_risk_level(calculate_risk_from_ml_models(latitude, longitude, time_utc)['risk_score']),
+                'risk_score': ml_result['risk_score'],
+                'risk_level': get_risk_level(ml_result['risk_score']),
             }
         }), 200
     
