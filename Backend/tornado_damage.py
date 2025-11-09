@@ -8,7 +8,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, log_loss
 from xgboost import XGBClassifier
 
-# Schema: lat, lon, time_utc, f1..f64, label_magn
+# Expected schema: lat, lon, time_utc, f1..f64, label_magn
 
 
 
@@ -47,6 +47,7 @@ def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, floa
 
 
 def _validate_columns(df: pd.DataFrame) -> None:
+    # Ensure the minimal required columns are present for magnitude classification
     required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_magn"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -136,7 +137,7 @@ def train_damage(
         random_state=random_state,
         n_jobs=0,
     )
-    # Train without early stopping for broader xgboost version compatibility
+    # Train without early stopping for broader XGBoost version compatibility
     clf.fit(X_tr, y_tr, sample_weight=sample_weight, eval_set=[(X_te, y_te)], verbose=False)
 
     proba = clf.predict_proba(X_te)

@@ -4,8 +4,16 @@ Tornado risk prediction with XGBoost using satellite embeddings and contextual s
 
 ## Quickstart
 
-- Backend (Flask)
+- Python deps
   - `pip install -r requirements.txt`
+  - If install fails, ensure at least: `earthengine-api`, `numpy`, `pandas`, `xgboost`, `flask`, `flask-cors`, `scikit-learn`.
+
+- Earth Engine (embeddings)
+  - `earthengine authenticate`
+  - Optional project (matches code default): `earthengine set_project gen-lang-client-0546266030`
+  - Quick test (prints a 64-d vector): `python Backend/model.py`
+
+- Backend (Flask)
   - `python Backend/api.py`
   - Check: open `http://localhost:5000/api/health`
 
@@ -51,6 +59,21 @@ CSV schema: `lat, lon, time_utc, f1..f64` (+ `label_occ` for probability, `label
 - `Backend/risk_inference.py` model loading + features
 - `Backend/models_prob/` and `Backend/models_damage/` pretrained models
 - `Frontend/` React app (Vite + Leaflet)
+
+## Python Files Overview
+
+- `Backend/api.py`: Flask API exposing health, single/batch risk, zones, and detailed inference endpoints; starts the server.
+- `Backend/risk_inference.py`: Loads XGBoost models, builds geo/time features, and returns probability and EF magnitude predictions.
+- `Backend/tornado_probability.py`: Trains the tornado occurrence classifier and saves the model/metadata (CLI usage).
+- `Backend/tornado_damage.py`: Trains the EF magnitude classifier and saves the model/metadata (CLI usage).
+- `Backend/generate_features_from_events.py`: Generates positives/negatives from `events.csv` and samples AlphaEarth embeddings via GEE (exports to Drive/GCS/local).
+- `Backend/generate_features_from_events_nopandas.py`: Minimal no‑pandas generator that writes `features.csv` (~40% positives) for quick tests.
+- `Backend/model.py`: Earth Engine example that fetches a 64‑dim AlphaEarth embedding at a given point.
+- `Backend/test.py`: Prototype pipeline to build a training CSV from events and random negatives using AlphaEarth sampling.
+- `Backend/test_tornado.py`: Utility to load, filter (2017–2024), and reshape tornado track data for exploration.
+- `embedding_match.py`: Helper to return a standardized `{embedding, lat, lon, time_utc}` record from AlphaEarth for a lat/lon/date.
+- `extract_alphaearth_local.py`: Local‑only AlphaEarth extractor; samples yearly embeddings and saves to CSV with paged downloads.
+- `Backend/extract_alphaearth_local.py`: Variant of the local AlphaEarth extractor scoped to the Backend folder.
 
 ## Troubleshooting
 

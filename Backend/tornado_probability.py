@@ -8,7 +8,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score
 from xgboost import XGBClassifier
 
-# Schema attendu: lat, lon, time_utc, f1..f64, label_occ, label_int_f, label_int_wind_ms
+# Expected schema: lat, lon, time_utc, f1..f64, label_occ, label_int_f, label_int_wind_ms
 
 EMBEDDING_DIM = 64
 EMBED_COLS = [f"f{i}" for i in range(1, EMBEDDING_DIM + 1)]
@@ -47,13 +47,13 @@ def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, floa
 
 def _validate_columns(df: pd.DataFrame) -> None:
     """
-    Vérifie la présence des colonnes minimales.
+    Validate presence of required minimum columns.
 
-    Colonnes requises pour le modèle de probabilité:
+    Required columns for the probability model:
       - lat, lon, time_utc, f1..f64, label_occ
 
-    Colonnes facultatives ignorées ou utilisées si présentes:
-      - label_ef (peut servir au pondération de sévérité)
+    Optional columns that may be ignored or used if present:
+      - label_ef (can be used for severity weighting)
     """
     required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_occ"]
     missing = [c for c in required if c not in df.columns]

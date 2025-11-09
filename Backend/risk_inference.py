@@ -217,7 +217,7 @@ def predict_all(
 
 
 # No module-level test execution; import-only module.
-#exemple: 
+# example:
 
 def test_few_examples():
     for i in range(100):
