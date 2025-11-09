@@ -111,14 +111,12 @@ def _load_dmg(model_dir: str = "models_damage"):
     if _dmg_cache is not None:
         return _dmg_cache
     base = _resolve_dir(model_dir)
-    f_path = os.path.join(base, "tornado_int_f_xgb.json")
-    w_path = os.path.join(base, "tornado_int_wind_xgb.json")
+    m_path = os.path.join(base, "tornado_magnitude_xgb.json")
     meta_path = os.path.join(base, "preprocess.json")
-    reg_f = XGBRegressor(); reg_f.load_model(f_path)
-    reg_w = XGBRegressor(); reg_w.load_model(w_path)
+    reg_m = XGBRegressor(); reg_m.load_model(m_path)
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
-    _dmg_cache = (reg_f, reg_w, meta["feature_names"])
+    _dmg_cache = (reg_m, meta["feature_names"])
     return _dmg_cache
 
 
@@ -156,7 +154,7 @@ def predict_probability(
 
 
 
-essential_damage_keys = ("intensity_f", "intensity_wind_ms")
+essential_damage_keys = ("tornado_magnitude")
 
 
 def predict_damage(
@@ -166,11 +164,10 @@ def predict_damage(
     time_utc: Union[str, datetime],
     model_damage_dir: str = "models_damage",
 ) -> Dict[str, float]:
-    reg_f, reg_w, feature_names = _load_dmg(model_damage_dir)
+    reg_m, feature_names = _load_dmg(model_damage_dir)
     X = _build_row(embedding, lat, lon, time_utc).reindex(columns=feature_names, fill_value=0.0)
     return {
-        "intensity_f": float(reg_f.predict(X)[0]),
-        "intensity_wind_ms": float(reg_w.predict(X)[0]),
+        "tornado_magnitude": float(reg_m.predict(X)[0]),
     }
 
 
@@ -195,6 +192,8 @@ def predict_all(
 
 
 embedding = np.random.rand(64).astype(float).tolist()
+
+
 d = predict_probability(
 embedding=embedding,
 lat=35.47,
@@ -202,4 +201,16 @@ lon=-97.52,
 time_utc="2025-05-02 14:30:00+00:00",
 model_prob_dir="models_prob",
 )
-print(d) # {"intensity_f": float, "intensity_wind_ms": float}
+
+m=predict_damage(
+embedding=embedding,
+lat=35.47,
+lon=-97.52,
+time_utc="2025-05-02 14:30:00+00:00",
+model_damage_dir="models_damage",
+)
+
+print(d) # float probability value
+
+
+print(m) # {"tornado_magnitude": float}

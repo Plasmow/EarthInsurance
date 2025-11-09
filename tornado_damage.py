@@ -8,7 +8,9 @@ import pandas as pd
 from sklearn.metrics import mean_squared_error
 from xgboost import XGBRegressor
 
-# Schema: lat, lon, time_utc, f1..f64, label_occ, label_int_f, label_int_wind_ms
+# Schema: lat, lon, time_utc, f1..f64, label_magn
+
+
 
 EMBEDDING_DIM = 64
 EMBED_COLS = [f"f{i}" for i in range(1, EMBEDDING_DIM + 1)]
@@ -25,11 +27,11 @@ def _parse_time_strict(s: Union[str, datetime]) -> datetime:
         raise ValueError("Empty time string")
     try:
         dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S%z")
-    except ValueError:
+    except ValueError as exc:
         if raw.endswith('Z'):
             dt = datetime.strptime(raw[:-1] + "+00:00", "%Y-%m-%d %H:%M:%S%z")
         else:
-            raise ValueError(f"Expected 'YYYY-MM-DD HH:MM:SS+HH:MM', got '{s}'")
+            raise ValueError(f"Expected 'YYYY-MM-DD HH:MM:SS+HH:MM', got '{s}'") from exc
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
@@ -45,7 +47,7 @@ def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, floa
 
 
 def _validate_columns(df: pd.DataFrame) -> None:
-    required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_occ", "label_int_f", "label_int_wind_ms"]
+    required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_magn"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Colonnes manquantes: {missing}")
@@ -65,8 +67,6 @@ def _build_X(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         "doy_cos": doy_cos,
         "hour_sin": hour_sin,
         "hour_cos": hour_cos,
-        # Optional: include occurrence label as feature for intensity (if known in training rows)
-        "occ_label": df["label_occ"].astype(int),
     })
     emb_df = df[EMBED_COLS].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     X = pd.concat([emb_df.reset_index(drop=True), geo_df.reset_index(drop=True)], axis=1)
@@ -80,11 +80,9 @@ def _load_train_test(train_csv: str, test_csv: str):
     _validate_columns(test_df)
     X_train, feature_names = _build_X(train_df)
     X_test, _ = _build_X(test_df)
-    y_f_train = pd.to_numeric(train_df["label_int_f"], errors="coerce").fillna(0.0)
-    y_f_test = pd.to_numeric(test_df["label_int_f"], errors="coerce").fillna(0.0)
-    y_w_train = pd.to_numeric(train_df["label_int_wind_ms"], errors="coerce").fillna(0.0)
-    y_w_test = pd.to_numeric(test_df["label_int_wind_ms"], errors="coerce").fillna(0.0)
-    return X_train, y_f_train, y_w_train, X_test, y_f_test, y_w_test, feature_names
+    y_train = pd.to_numeric(train_df["label_magn"], errors="coerce").fillna(0.0)
+    y_test = pd.to_numeric(test_df["label_magn"], errors="coerce").fillna(0.0)
+    return X_train, y_train, X_test, y_test, feature_names
 
 
 def _tree_method(use_gpu: bool) -> str:
@@ -99,9 +97,9 @@ def train_damage(
     random_state: int = 42,
 ) -> Dict[str, float]:
     os.makedirs(outdir, exist_ok=True)
-    (X_tr, y_f_tr, y_w_tr, X_te, y_f_te, y_w_te, feature_names) = _load_train_test(train_csv, test_csv)
+    (X_tr, y_tr, X_te, y_te, feature_names) = _load_train_test(train_csv, test_csv)
 
-    reg_f = XGBRegressor(
+    reg = XGBRegressor(
         n_estimators=5000,
         max_depth=9,
         learning_rate=0.03,
@@ -116,29 +114,11 @@ def train_damage(
         n_jobs=0,
     )
     # Train without early stopping for broader xgboost version compatibility
-    reg_f.fit(X_tr, y_f_tr, eval_set=[(X_te, y_f_te)], verbose=False)
+    reg.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
 
-    reg_w = XGBRegressor(
-        n_estimators=5000,
-        max_depth=9,
-        learning_rate=0.03,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        min_child_weight=2.0,
-        reg_lambda=1.5,
-        objective="reg:squarederror",
-        eval_metric="rmse",
-        tree_method=_tree_method(use_gpu),
-        random_state=random_state,
-        n_jobs=0,
-    )
-    reg_w.fit(X_tr, y_w_tr, eval_set=[(X_te, y_w_te)], verbose=False)
+    rmse = float(np.sqrt(mean_squared_error(y_te, reg.predict(X_te))))
 
-    rmse_f = float(np.sqrt(mean_squared_error(y_f_te, reg_f.predict(X_te))))
-    rmse_w = float(np.sqrt(mean_squared_error(y_w_te, reg_w.predict(X_te))))
-
-    reg_f.save_model(os.path.join(outdir, "tornado_int_f_xgb.json"))
-    reg_w.save_model(os.path.join(outdir, "tornado_int_wind_xgb.json"))
+    reg.save_model(os.path.join(outdir, "tornado_magnitude_xgb.json"))
     with open(os.path.join(outdir, "preprocess.json"), "w", encoding="utf-8") as f:
         json.dump({
             "feature_names": feature_names,
@@ -147,17 +127,15 @@ def train_damage(
             "created_utc": datetime.utcnow().isoformat() + "Z",
         }, f, indent=2)
 
-    return {"rmse_int_f": rmse_f, "rmse_int_wind": rmse_w}
+    return {"rmse_magnitude": rmse}
 
 
-def _load_models(model_dir: str):
-    reg_f = XGBRegressor()
-    reg_w = XGBRegressor()
-    reg_f.load_model(os.path.join(model_dir, "tornado_int_f_xgb.json"))
-    reg_w.load_model(os.path.join(model_dir, "tornado_int_wind_xgb.json"))
+def _load_model(model_dir: str):
+    reg = XGBRegressor()
+    reg.load_model(os.path.join(model_dir, "tornado_magnitude_xgb.json"))
     with open(os.path.join(model_dir, "preprocess.json"), "r", encoding="utf-8") as f:
         meta = json.load(f)
-    return reg_f, reg_w, meta["feature_names"]
+    return reg, meta["feature_names"]
 
 
 def _build_single_row(embedding: List[float], lat: float, lon: float, time_utc: Union[str, datetime]) -> pd.DataFrame:
@@ -175,18 +153,17 @@ def _build_single_row(embedding: List[float], lat: float, lon: float, time_utc: 
         "doy_cos": d_cos,
         "hour_sin": h_sin,
         "hour_cos": h_cos,
-        "occ_label": 0.0,  # placeholder when predicting intensity alone
     })
     return pd.DataFrame([row])
 
 
 def predict_damage(model_dir: str, embedding: List[float], lat: float, lon: float, time_utc: Union[str, datetime]) -> Dict[str, float]:
-    reg_f, reg_w, feature_names = _load_models(model_dir)
+    # Backward-compatible function name; now returns magnitude only
+    reg, feature_names = _load_model(model_dir)
     X = _build_single_row(embedding=embedding, lat=lat, lon=lon, time_utc=time_utc)
     X = X.reindex(columns=feature_names, fill_value=0.0)
     return {
-        "intensity_f": float(reg_f.predict(X)[0]),
-        "intensity_wind_ms": float(reg_w.predict(X)[0]),
+        "magnitude": float(reg.predict(X)[0]),
     }
 
 
@@ -214,7 +191,7 @@ def main():
                 return
         print("No arguments and train.csv/test.csv not found in CWD or ./data.")
 
-    parser = argparse.ArgumentParser(description="XGBoost tornado intensity (F-scale and wind) prediction")
+    parser = argparse.ArgumentParser(description="XGBoost tornado magnitude prediction")
     sub = parser.add_subparsers(dest="cmd")
 
     p_train = sub.add_parser("train", help="Train regressors with train/test CSVs")
@@ -224,7 +201,7 @@ def main():
     p_train.add_argument("--gpu", action="store_true")
     p_train.add_argument("--seed", type=int, default=42)
 
-    p_pred = sub.add_parser("predict", help="Predict intensities for one example")
+    p_pred = sub.add_parser("predict", help="Predict magnitude for one example")
     p_pred.add_argument("--modeldir", default="models_damage")
     p_pred.add_argument("--embedding", required=True, help="Comma-separated 64 floats or @path")
     p_pred.add_argument("--lat", type=float, required=True)
