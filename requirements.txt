@@ -1,12 +1,10 @@
-
 earthengine-api
-<<<<<<< HEAD
+flask
+flask-cors
+numpy
 pandas
-=======
-pandas
+scikit-learn
+xgboost
 geopandas
 shapely
-numpy
-scikit-learn
 pyproj
->>>>>>> origin/Adam

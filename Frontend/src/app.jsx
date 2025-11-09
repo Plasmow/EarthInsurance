@@ -3,7 +3,7 @@ import { MapContainer, TileLayer, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 
-// Fix pour les icones Leaflet
+// Fix for Leaflet default marker icons
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
@@ -11,7 +11,7 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
 
-// Fonction pour obtenir la couleur selon le risque
+// Color helper based on risk score
 const getRiskColor = (riskScore) => {
   if (riskScore >= 0.8) return '#8B0000';
   if (riskScore >= 0.6) return '#FF4500';
@@ -20,7 +20,7 @@ const getRiskColor = (riskScore) => {
   return '#00AA00';
 };
 
-// Composant pour gérer les clics sur la carte
+// Component handling map click events
 function MapClickHandler({ onLocationClick }) {
   useMapEvents({
     click(e) {
@@ -31,7 +31,7 @@ function MapClickHandler({ onLocationClick }) {
   return null;
 }
 
-// Composant pour afficher les zones de risque
+// Component to render risk zones as circle markers
 function RiskCircles({ riskZones }) {
   const map = useMap();
 

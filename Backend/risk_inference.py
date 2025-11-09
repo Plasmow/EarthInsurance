@@ -273,7 +273,7 @@ def predict_all(
 
 
 # No module-level test execution; import-only module.
-#exemple: 
+# example:
 
 # Removed automatic execution of random test examples and sample prediction;
 # keep a lightweight manual test helper callable by user code if desired.

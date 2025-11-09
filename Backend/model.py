@@ -3,34 +3,34 @@ import numpy as np
 
 ee.Initialize(project='gen-lang-client-0546266030')
 
-# Définir un point simple (ici Paris)
+# Define a simple point (Paris)
 pt = ee.Geometry.Point(2.35, 48.85)
 
-# Filtrer la collection pour garder uniquement les images couvrant ce point
+# Filter the collection to keep only images covering this point
 collection = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL').filterBounds(pt)
 
-# Vérifie qu’il y a bien une image
+# Ensure at least one image is available
 count = collection.size().getInfo()
-print("Nombre d'images couvrant le point :", count)
+print("Number of images covering the point:", count)
 
 if count == 0:
-    raise RuntimeError("Aucune tuile d'embedding ne couvre ce point.")
+    raise RuntimeError("No embedding tile covers this point.")
 
-# Prendre la première image valide
+# Take the first valid image
 img = collection.first()
 
-# Échantillonner ce point
+# Sample this point
 sample = img.sample(region=pt, scale=30).first()
 
 if sample is None:
-    raise RuntimeError("⚠️ Aucun pixel valide trouvé dans cette tuile (peut-être NoData).")
+    raise RuntimeError("⚠️ No valid pixel found in this tile (possibly NoData).")
 
-# Transformer en dictionnaire
+# Convert to a dictionary
 vals = sample.toDictionary().getInfo()
 embedding = np.array([vals[f"A{i:02d}"] for i in range(0, 64)], dtype=float)
 print("Embedding vector (64):", embedding)
 print("embedding value types:", [type(vals[f"A{i:02d}"]) for i in range(0, 64)])
 
-print("Couverture de la tuile :", img.geometry().bounds(1).getInfo())
-#                         ici ---------^   maxError en mètres (par ex. 1)
+print("Tile coverage:", img.geometry().bounds(1).getInfo())
+#                            here -----^   maxError in meters (e.g., 1)
 

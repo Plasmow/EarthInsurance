@@ -3,12 +3,12 @@
 """
 Batch feature extraction from events.csv using Google Satellite Embedding (AlphaEarth) on GEE.
 
-- Lit data/events.csv, construit les positifs (milieu du segment, horodaté UTC).
-- Génère des négatifs aléatoires hors buffer 3 km des événements, et hors fenêtre ±3h (au pas 1h) des événements.
-- Concatène (positifs + négatifs) → FeatureCollection avec props {lat, lon, time_utc, year, split}.
-- Pour chaque année présente → sampleRegions (64D) côté serveur → Export table (Drive ou GCS).
+- Reads data/events.csv and builds positives (segment midpoint, UTC timestamped).
+- Generates random negatives outside a 3 km buffer around events and outside the ±3h window (1h steps).
+- Concatenates (positives + negatives) → FeatureCollection with props {lat, lon, time_utc, year, split}.
+- For each year present → sampleRegions (64D) on the server side → export to table (Drive or GCS).
 
-Dépendances : earthengine-api (ee.Authenticate puis ee.Initialize()).
+Dependencies: earthengine-api (ee.Authenticate then ee.Initialize()).
 """
 
 import sys, os, csv, argparse, time, math, random
@@ -21,7 +21,7 @@ COLLECTION_ID = 'GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL'
 US_LAT_MIN, US_LAT_MAX = 24.5, 49.5
 US_LON_MIN, US_LON_MAX = -125.0, -66.0
 
-# Bande(s) explicites: embedding_0..embedding_63
+# Explicit bands: embedding_0..embedding_63
 EMB_BANDS = [f'embedding_{i}' for i in range(64)]
 
 def log(msg: str):
@@ -79,7 +79,7 @@ def main():
         ee.Initialize(project='gen-lang-client-0546266030')
     log('EE ready.')
 
-    # ---- Lecture events.csv
+    # ---- Read events.csv
     log(f'Loading events from {args.events} …')
     try:
         with open(args.events, 'r', encoding='utf-8-sig', newline='') as f:
@@ -93,7 +93,7 @@ def main():
         print('ERROR: events.csv empty.', file=sys.stderr)
         sys.exit(1)
 
-    # Détection colonnes
+    # Column detection (case-insensitive)
     lc = {c.lower(): c for c in fns}
     def get_col(cands: List[str], default=None):
         for c in cands:
@@ -107,7 +107,7 @@ def main():
     col_elon = get_col(['end_lon','end longitude','end_longitude','elon']) or 'End_Lon'
     col_date = get_col(['begin_time_utc','date','datetime','time','start_time']) or 'Date'
 
-    # ---- Positifs (milieu du segment)
+    # ---- Positives (segment midpoint)
     pos_feats = []
     years_local = set()
     for r in rows:
@@ -135,8 +135,8 @@ def main():
         sys.exit(1)
     log(f'Parsed positives: {n_pos}')
 
-    # ---- Négatifs (hors buffer 3 km, temps hors ±3h)
-    # Géométrie sûre
+    # ---- Negatives (outside 3 km buffer, and outside ±3h window)
+    # Safe geometry
     line_feats = []
     for r in rows:
         slat, slon = safe_float(r.get(col_slat)), safe_float(r.get(col_slon))
@@ -149,14 +149,14 @@ def main():
     us_geom = ee.Geometry.Rectangle([US_LON_MIN, US_LAT_MIN, US_LON_MAX, US_LAT_MAX], None, False)
     safe_region = us_geom.difference(buffered_union, 1)
 
-    # Fenêtre temporelle globale
+    # Global time window
     pos_times = [parse_time_utc(r.get(col_date)) for r in rows if parse_time_utc(r.get(col_date)) is not None]
     min_dt = min(pos_times)
     max_dt = max(pos_times)
     min_date = ee.Date(min_dt.isoformat())
     span_hours = max(0, int((max_dt - min_dt).total_seconds() // 3600))
 
-    # Heures interdites (±3h) autour des événements
+    # Forbidden hours (±3h) around events
     forbidden = set()
     for dt in pos_times:
         off = int((dt - min_dt).total_seconds() // 3600)
@@ -168,7 +168,7 @@ def main():
     allowed_list = ee.List(allowed)
     allowed_size = allowed_list.size()
 
-    # Nombre de négatifs pour ~40% de positifs
+    # Number of negatives to reach ~40% positives share
     total_target = int(round(n_pos / 0.4))
     n_neg = max(total_target - n_pos, 0)
     log(f'Generating ~{n_neg} negatives…')
@@ -193,7 +193,7 @@ def main():
 
     all_fc = pos_fc.merge(neg_fc)
 
-    # ---- Échantillonnage par année
+    # ---- Yearly sampling
     years = sorted(list(years_local))
     if not years:
         years = list(range(min_dt.year, max_dt.year + 1))
@@ -205,7 +205,7 @@ def main():
         start = ee.Date.fromYMD(y, 1, 1)
         end   = start.advance(1, 'year')
         img = ee.ImageCollection(COLLECTION_ID).filterDate(start, end).first()
-        # fallback ±2 ans si image absente
+        # Fallback ±2 years if image is missing
         img = ee.Image(ee.Algorithms.If(
             img, img,
             ee.ImageCollection(COLLECTION_ID)
@@ -214,17 +214,17 @@ def main():
         ))
         img = ee.Image(img)
 
-        # Sélection explicite des bandes d'embedding et renommage f1..f{dims}
+        # Select embedding bands and rename to f1..f{dims}
         emb = img.select(EMB_BANDS[:dims])
         new_names = [f'f{i}' for i in range(1, dims+1)]
         emb = emb.rename(new_names)
 
         year_fc = all_fc.filter(ee.Filter.eq('year', y))
-        # Important: géométries inutiles pour la sortie → geometries=False
+        # Important: no geometries in the output → geometries=False
         samp = emb.sampleRegions(collection=year_fc, scale=args.scale, geometries=False, tileScale=2)
 
         if args.export == 'local':
-            # (Lent) récupération paginée locale
+            # (Slow) local paginated retrieval
             total = int(samp.size().getInfo() or 0)
             log(f'Year {y}: {total} rows → local CSV {args.out}')
             write_header = not os.path.exists(args.out) or os.path.getsize(args.out) == 0

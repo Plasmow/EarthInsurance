@@ -63,7 +63,7 @@ def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, floa
 
 def _validate_columns(df: pd.DataFrame) -> None:
     """
-    Vérifie la présence des colonnes minimales.
+    Validate presence of required minimum columns.
 
     Colonnes requises pour le modèle de probabilité:
       - lat, lon, time_utc, f1..f64, label

@@ -1,57 +1,82 @@
 # EarthInsurance
 
-Tornado risk prediction using XGBoost with satellite embeddings and contextual features.
+Tornado risk prediction with XGBoost using satellite embeddings and contextual spatiotemporal features. Ships a Flask API and a React + Leaflet map UI.
 
-## Data schema
+## Quickstart
 
-Training CSV must include:
+- Python deps
+  - `pip install -r requirements.txt`
+  - If install fails, ensure at least: `earthengine-api`, `numpy`, `pandas`, `xgboost`, `flask`, `flask-cors`, `scikit-learn`.
 
-- E0..E63: 64-d embedding floats (from AlphaEarth)
-- lat, lon: decimal degrees
-- period_start: date string (YYYY-MM-DD). Optional: period_end (for duration)
-- flood_occurred: 0/1 flag
-- flood_intensity: optional numeric (if missing, a proxy is computed from `flood_depth_m` and `flood_duration_days` when available)
-- tornado_occurred: 0/1 label (target)
-- tornado_intensity: numeric label (target)
+- Earth Engine (embeddings)
+  - `earthengine authenticate`
+  - Optional project (matches code default): `earthengine set_project gen-lang-client-0546266030`
+  - Quick test (prints a 64-d vector): `python Backend/model.py`
 
-Additional numeric columns are automatically included as features.
+- Backend (Flask)
+  - `python Backend/api.py`
+  - Check: open `http://localhost:5000/api/health`
 
-## Quick start
+- Frontend (React + Vite)
+  - `cd Frontend && npm install`
+  - `npm run dev`
+  - Open the shown URL (e.g., `http://localhost:5173`) and click on the map. Backend defaults to `http://localhost:5000`.
 
-0) Install dependencies (Windows cmd):
+## What It Does
 
-```
-py -m pip install -r requirements.txt
-```
-1) Authenticate to GoogleEarth (first request access to the owner to manage API requests)
+- Predicts tornado occurrence probability and EF-scale magnitude distribution (EF0–EF5).
+- Computes a combined risk score and human-readable labels.
+- Visualizes results on an interactive map with color-coded markers.
 
-```
-earthengine authenticate
-```
+## API (Cheat Sheet)
 
+- POST `/api/calculate-risk`
+  - Body:
+    ```json
+    { "latitude": 35.47, "longitude": -97.52, "time_utc": "2025-05-02 14:30:00+00:00" }
+    ```
+    `time_utc` optional; ISO with `Z` also accepted.
+  - Returns: `risk_score` (0–1), `risk_level`, `probability`, `magnitude` (0–5), `magnitude_probs` (EF0..EF5), `tornado_damage`, `ef_label`.
 
+Other endpoints: `/api/health`, `/api/batch-calculate-risk`, `/api/risk-zones`, `/api/predict-detailed`.
 
-2) Train with a synthetic dataset (for a quick test):
+## Train Models (Optional)
 
-```
-py tornado_risk_model.py train --synthetic --outdir models
-```
+- Probability (occurrence):
+  ```
+  python Backend/tornado_probability.py train --train path/to/train.csv --test path/to/test.csv --outdir Backend/models_prob
+  ```
+- Magnitude (EF classifier):
+  ```
+  python Backend/tornado_damage.py train --train path/to/train_i.csv --test path/to/test_i.csv --outdir Backend/models_damage
+  ```
 
-This prints AUC, average precision, and RMSE, and writes models to `models/`.
+CSV schema: `lat, lon, time_utc, f1..f64` (+ `label_occ` for probability, `label_magn` for magnitude). Time format: `YYYY-MM-DD HH:MM:SS+HH:MM` or `...Z`.
 
-3) Predict for a single example:
+## Repo Layout
 
-```
-py tornado_risk_model.py predict --modeldir models \
-	--embedding "0.1,0.2,0.3, ... 64 values ..." \
-	--lat 35.1 --lon -97.5 --start 2024-05-01 --end 2024-05-15 --flood --flood_intensity 1.2
-```
+- `Backend/api.py` Flask API
+- `Backend/risk_inference.py` model loading + features
+- `Backend/models_prob/` and `Backend/models_damage/` pretrained models
+- `Frontend/` React app (Vite + Leaflet)
 
-Alternatively you can pass a `.npy` file with `--embedding @path/to/vec.npy`.
+## Python Files Overview
 
-## Notes
+- `Backend/api.py`: Flask API exposing health, single/batch risk, zones, and detailed inference endpoints; starts the server.
+- `Backend/risk_inference.py`: Loads XGBoost models, builds geo/time features, and returns probability and EF magnitude predictions.
+- `Backend/tornado_probability.py`: Trains the tornado occurrence classifier and saves the model/metadata (CLI usage).
+- `Backend/tornado_damage.py`: Trains the EF magnitude classifier and saves the model/metadata (CLI usage).
+- `Backend/generate_features_from_events.py`: Generates positives/negatives from `events.csv` and samples AlphaEarth embeddings via GEE (exports to Drive/GCS/local).
+- `Backend/generate_features_from_events_nopandas.py`: Minimal no‑pandas generator that writes `features.csv` (~40% positives) for quick tests.
+- `Backend/model.py`: Earth Engine example that fetches a 64‑dim AlphaEarth embedding at a given point.
+- `Backend/test.py`: Prototype pipeline to build a training CSV from events and random negatives using AlphaEarth sampling.
+- `Backend/test_tornado.py`: Utility to load, filter (2017–2024), and reshape tornado track data for exploration.
+- `embedding_match.py`: Helper to return a standardized `{embedding, lat, lon, time_utc}` record from AlphaEarth for a lat/lon/date.
+- `extract_alphaearth_local.py`: Local‑only AlphaEarth extractor; samples yearly embeddings and saves to CSV with paged downloads.
+- `Backend/extract_alphaearth_local.py`: Variant of the local AlphaEarth extractor scoped to the Backend folder.
 
-- Classification and regression are trained separately (occurrence probability and intensity).
-- Temporal seasonality is encoded with cyclical month features; optional duration is included if `period_end` is provided.
-- Class imbalance is handled via `scale_pos_weight`.
-- Model files: `models/tornado_classifier.json`, `models/tornado_regressor.json`, and preprocessing metadata in `models/preprocess.json`.
+## Troubleshooting
+
+- Start backend before frontend; verify `/api/health`.
+- Ensure model JSONs + `preprocess.json` exist in `Backend/models_*`.
+- If ports change, update fetch URL in `Frontend/src/App.jsx`.
