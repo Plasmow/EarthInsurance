@@ -15,9 +15,47 @@ EMBED_COLS = [f"f{i}" for i in range(1, EMBEDDING_DIM + 1)]
 
 
 def _parse_time_strict(s: Union[str, datetime]) -> datetime:
+	"""Parse timestamps like 'YYYY-MM-DD HH:MM:SS' optionally with timezone suffix:
+	examples: '2024-05-08 04:00:00', '2024-05-08 04:00:00Z', '2024-05-08 04:00:00+00:00', '2024-05-08 04:00:00+02:00'
+	Returned datetime is normalized to UTC (naive, no tzinfo) for consistency.
+	"""
 	if isinstance(s, datetime):
+		# If aware, convert to UTC and drop tzinfo
+		if s.tzinfo is not None:
+			return (s.astimezone(datetime.timezone.utc)).replace(tzinfo=None)
 		return s
-	return datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S")
+	raw = str(s).strip()
+	if not raw:
+		raise ValueError("Empty time string")
+	# Remove trailing Z -> +00:00
+	if raw.endswith('Z'):
+		raw = raw[:-1] + '+00:00'
+	# If no offset, add +00:00 so we can unify parsing paths
+	has_offset = ('+' in raw[10:] or '-' in raw[10:]) and (len(raw) > 19)
+	base_part = raw
+	try_formats = [
+		"%Y-%m-%d %H:%M:%S%z",
+		"%Y-%m-%d %H:%M:%S",
+	]
+	for fmt in try_formats:
+		try:
+			dt = datetime.strptime(base_part, fmt)
+			# If offset aware -> convert to UTC
+			if dt.tzinfo is not None:
+				dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+			return dt
+		except Exception:
+			continue
+	# If no offset and not parsed, retry by appending +00:00
+	if not has_offset:
+		for fmt in ["%Y-%m-%d %H:%M:%S%z"]:
+			try:
+				dt = datetime.strptime(base_part + "+00:00", fmt)
+				dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+				return dt
+			except Exception:
+				pass
+	raise ValueError(f"Cannot parse time string '{s}'")
 
 
 def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, float]:
@@ -35,7 +73,7 @@ def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, floa
 
 
 def _validate_columns(df: pd.DataFrame) -> None:
-	required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_occ", "label_int_f", "label_int_wind_ms"]
+	required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_occ"]
 	missing = [c for c in required if c not in df.columns]
 	if missing:
 		raise ValueError(f"Colonnes manquantes: {missing}")
@@ -170,23 +208,25 @@ def main():
 	import argparse
 	import sys
 
-	# Auto-run training if no arguments: expects train.csv and test.csv in data folder
+	# Auto-run training if no arguments: looks for train.csv/test.csv in CWD or ./data
 	if len(sys.argv) == 1:
-		default_train = os.path.join(os.getcwd(), "data", "train.csv")
-		default_test = os.path.join(os.getcwd(), "data", "test.csv")
-		if os.path.exists(default_train) and os.path.exists(default_test):
-			print(f"[auto] Training with {default_train} and {default_test} ...")
-			metrics = train_probability(
-				train_csv=default_train,
-				test_csv=default_test,
-				outdir="models_prob",
-				use_gpu=False,
-				random_state=42,
-			)
-			print(json.dumps(metrics, indent=2))
-			return
-		else:
-			print("No arguments and train.csv/test.csv not found in current directory.")
+		candidates = [
+			(os.path.join(os.getcwd(), "train.csv"), os.path.join(os.getcwd(), "test.csv")),
+			(os.path.join(os.getcwd(), "data", "train.csv"), os.path.join(os.getcwd(), "data", "test.csv")),
+		]
+		for tr, te in candidates:
+			if os.path.exists(tr) and os.path.exists(te):
+				print(f"[auto] Training with {tr} and {te} ...")
+				metrics = train_probability(
+					train_csv=tr,
+					test_csv=te,
+					outdir="models_prob",
+					use_gpu=False,
+					random_state=42,
+				)
+				print(json.dumps(metrics, indent=2))
+				return
+		print("No arguments and train.csv/test.csv not found in CWD or ./data.")
 
 	parser = argparse.ArgumentParser(description="XGBoost probability of tornado occurrence")
 	sub = parser.add_subparsers(dest="cmd")
