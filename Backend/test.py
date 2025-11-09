@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Génère un CSV d'entraînement pour prédiction de tornades.
+Génère un CSV d'entraînement pour prédiction de tornades avec magnitude.
 
 POSITIFS: Vecteurs AlphaEarth de l'année AVANT chaque tornade de events.csv
 NÉGATIFS: Points aléatoires aux USA (même distribution temporelle)
 
-Format de sortie: lat, lon, time_utc, f1, f2, ..., f64, label
+Format de sortie: lat, lon, time_utc, f1, f2, ..., f64, label, magnitude
   label = 1 (tornade), 0 (pas de tornade)
+  magnitude = 0-5 (échelle EF) pour les tornades, 0 pour les points négatifs
 """
 
 import ee
@@ -64,8 +65,31 @@ def parse_datetime(s: str) -> Optional[datetime]:
     except Exception:
         return None
 
+def parse_magnitude(mag_str: str) -> int:
+    """
+    Parse la magnitude d'une tornade depuis la colonne TOR_F_SCALE ou similaire.
+    Retourne un entier entre 0 et 5 (échelle EF).
+    """
+    if not mag_str or mag_str.strip() == "":
+        return 0
+    
+    mag_str = mag_str.strip().upper()
+    
+    # Enlever les préfixes comme "EF", "F", etc.
+    if mag_str.startswith("EF"):
+        mag_str = mag_str[2:]
+    elif mag_str.startswith("F"):
+        mag_str = mag_str[1:]
+    
+    try:
+        mag = int(mag_str)
+        # Clamp entre 0 et 5
+        return max(0, min(5, mag))
+    except ValueError:
+        return 0
+
 def load_events(csv_path: str):
-    """Charge les événements de events.csv."""
+    """Charge les événements de events.csv avec leur magnitude."""
     log(f"Chargement de {csv_path}...")
     
     try:
@@ -91,9 +115,18 @@ def load_events(csv_path: str):
     col_elat = get_col(['end_lat', 'end latitude', 'elat']) or 'End_Lat'
     col_elon = get_col(['end_lon', 'end longitude', 'elon']) or 'End_Lon'
     col_date = get_col(['begin_time_utc', 'date', 'datetime', 'time']) or 'Date'
+    col_magnitude = get_col(['tor_f_scale', 'magnitude', 'ef_scale', 'f_scale']) or 'TOR_F_SCALE'
+    
+    log(f"Colonnes détectées:")
+    log(f"  - Latitude: {col_slat}")
+    log(f"  - Longitude: {col_slon}")
+    log(f"  - Date: {col_date}")
+    log(f"  - Magnitude: {col_magnitude}")
     
     # Parser les événements
     events = []
+    magnitude_counts = defaultdict(int)
+    
     for r in rows:
         try:
             slat = float(r[col_slat]) if r.get(col_slat, "") else None
@@ -101,6 +134,7 @@ def load_events(csv_path: str):
             elat = float(r[col_elat]) if r.get(col_elat, "") else None
             elon = float(r[col_elon]) if r.get(col_elon, "") else None
             dt = parse_datetime(r.get(col_date, ""))
+            magnitude = parse_magnitude(r.get(col_magnitude, ""))
             
             if None in (slat, slon, elat, elon) or dt is None:
                 continue
@@ -109,21 +143,28 @@ def load_events(csv_path: str):
             lat = (slat + elat) / 2.0
             lon = (slon + elon) / 2.0
             
+            magnitude_counts[magnitude] += 1
+            
             events.append({
                 'lat': lat,
                 'lon': lon,
                 'time': dt,
                 'year': dt.year,
-                'label': 1  # Positif
+                'label': 1,  # Positif
+                'magnitude': magnitude
             })
-        except Exception:
+        except Exception as e:
             continue
     
     log(f"✅ {len(events)} événements chargés")
+    log(f"Distribution des magnitudes:")
+    for mag in sorted(magnitude_counts.keys()):
+        log(f"  EF{mag}: {magnitude_counts[mag]} ({magnitude_counts[mag]/len(events)*100:.1f}%)")
+    
     return events
 
 def generate_negatives(n_neg: int, events: List[dict], seed: int = 123):
-    """Génère des points négatifs aléatoires."""
+    """Génère des points négatifs aléatoires (magnitude=0)."""
     log(f"Génération de {n_neg} négatifs...")
     
     random.seed(seed)
@@ -150,7 +191,8 @@ def generate_negatives(n_neg: int, events: List[dict], seed: int = 123):
             'lon': lon,
             'time': dt,
             'year': year,
-            'label': 0  # Négatif
+            'label': 0,  # Négatif
+            'magnitude': 0  # Pas de tornade = magnitude 0
         })
     
     log(f"✅ {len(negatives)} négatifs générés")
@@ -252,11 +294,11 @@ def sample_points_by_year(all_points: List[dict], lookback_years: int = 1):
     return results
 
 def write_training_csv(all_points: List[dict], results: dict, output_path: str):
-    """Écrit le CSV d'entraînement."""
+    """Écrit le CSV d'entraînement avec magnitude."""
     log(f"\nÉcriture de {output_path}...")
     
-    # Header: lat, lon, time_utc, f1, f2, ..., f64, label
-    header = ['lat', 'lon', 'time_utc'] + [f'f{i}' for i in range(1, DIMS + 1)] + ['label']
+    # Header: lat, lon, time_utc, f1, f2, ..., f64, label, magnitude
+    header = ['lat', 'lon', 'time_utc'] + [f'f{i}' for i in range(1, DIMS + 1)] + ['label', 'magnitude']
     
     valid_count = 0
     invalid_count = 0
@@ -288,12 +330,12 @@ def write_training_csv(all_points: List[dict], results: dict, output_path: str):
             else:
                 invalid_count += 1
             
-            # Écrire la ligne
+            # Écrire la ligne avec magnitude
             row = [
                 f"{pt['lat']:.6f}",
                 f"{pt['lon']:.6f}",
                 pt['time'].strftime('%Y-%m-%dT%H:%M:%SZ')
-            ] + [f"{f:.6f}" if f == f else "" for f in features] + [pt['label']]
+            ] + [f"{f:.6f}" if f == f else "" for f in features] + [pt['label'], pt['magnitude']]
             
             writer.writerow(row)
     
@@ -304,12 +346,12 @@ def write_training_csv(all_points: List[dict], results: dict, output_path: str):
 def main():
     """Fonction principale."""
     print("\n" + "="*80)
-    print("  GÉNÉRATION CSV D'ENTRAÎNEMENT - Prédiction de Tornades")
+    print("  GÉNÉRATION CSV D'ENTRAÎNEMENT - Prédiction de Tornades avec Magnitude")
     print("="*80)
     
     # Configuration
     EVENTS_CSV = 'data/events.csv'
-    OUTPUT_CSV = 'data/training.csv'
+    OUTPUT_CSV = 'data/training2.csv'
     LOOKBACK_YEARS = 1  # Utiliser l'image de l'année AVANT l'événement
     NEG_RATIO = 1.5  # 1.5x plus de négatifs que de positifs
     
@@ -346,6 +388,7 @@ def main():
     print(f"Positifs (tornades): {len(positives)}")
     print(f"Négatifs (random): {len(negatives)}")
     print(f"Lookback: {LOOKBACK_YEARS} an(s)")
+    print(f"Nouvelle colonne: magnitude (0-5)")
     print()
 
 if __name__ == "__main__":

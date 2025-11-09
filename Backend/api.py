@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 from datetime import datetime
+import traceback
 
 app = Flask(__name__)
 CORS(app)
@@ -43,6 +44,84 @@ def convert_to_expected_format(time_str):
         print(f"Erreur lors de la conversion du timestamp: {e}")
         # Fallback: retourner le timestamp actuel au bon format
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
+
+
+# ==============================================================================
+# UTILITAIRES POUR PARSER LES RÉSULTATS ML
+# ==============================================================================
+
+def parse_probability_result(result):
+    """
+    Parse le résultat de predict_probability quel que soit son format.
+    Retourne: (probability, magnitude, magnitude_probs)
+    """
+    try:
+        # Cas 1: C'est un dictionnaire avec toutes les infos
+        if isinstance(result, dict):
+            return (
+                float(result.get('probability', 0.0)),
+                int(result.get('magnitude', 0)),
+                [float(p) for p in result.get('magnitude_probs', [0.0] * 6)]
+            )
+        
+        # Cas 2: C'est un tuple (probability, magnitude, probs)
+        elif isinstance(result, tuple) and len(result) >= 3:
+            return (
+                float(result[0]),
+                int(result[1]),
+                [float(p) for p in result[2]]
+            )
+        
+        # Cas 3: C'est un tuple (probability, magnitude)
+        elif isinstance(result, tuple) and len(result) == 2:
+            return (
+                float(result[0]),
+                int(result[1]),
+                [0.0] * 6
+            )
+        
+        # Cas 4: C'est juste une probabilité (float)
+        elif isinstance(result, (int, float)):
+            return (float(result), 0, [0.0] * 6)
+        
+        # Cas 5: Résultat inattendu
+        else:
+            print(f"Format de résultat inattendu pour predict_probability: {type(result)}")
+            return (0.0, 0, [0.0] * 6)
+            
+    except Exception as e:
+        print(f"Erreur lors du parsing du résultat de probabilité: {e}")
+        traceback.print_exc()
+        return (0.0, 0, [0.0] * 6)
+
+
+def parse_damage_result(result):
+    """
+    Parse le résultat de predict_damage quel que soit son format.
+    Retourne: tornado_damage (float)
+    """
+    try:
+        # Cas 1: C'est un dictionnaire
+        if isinstance(result, dict):
+            return float(result.get('tornado_magnitude', 0.0))
+        
+        # Cas 2: C'est directement une valeur numérique
+        elif isinstance(result, (int, float)):
+            return float(result)
+        
+        # Cas 3: C'est un tuple, prendre le premier élément
+        elif isinstance(result, tuple) and len(result) > 0:
+            return float(result[0])
+        
+        # Cas 4: Résultat inattendu
+        else:
+            print(f"Format de résultat inattendu pour predict_damage: {type(result)}")
+            return 0.0
+            
+    except Exception as e:
+        print(f"Erreur lors du parsing du résultat de dégâts: {e}")
+        traceback.print_exc()
+        return 0.0
 
 
 # ==============================================================================
@@ -114,7 +193,12 @@ def calculate_risk_from_ml_models(latitude, longitude, time_utc=None):
     embedding = generate_embedding(latitude, longitude, time_utc)
     
     # Prédire la probabilité et la magnitude
+    probability = 0.0
+    magnitude = 0
+    magnitude_probs = [0.0] * 6
+    
     try:
+        print(f"Appel predict_probability pour lat={latitude}, lon={longitude}")
         prob_result = predict_probability(
             embedding=embedding,
             lat=latitude,
@@ -122,19 +206,20 @@ def calculate_risk_from_ml_models(latitude, longitude, time_utc=None):
             time_utc=time_utc,
             model_prob_dir="models_prob"
         )
+        print(f"Résultat brut predict_probability: {prob_result} (type: {type(prob_result)})")
         
-        probability = prob_result.get('probability', 0.0)
-        magnitude = prob_result.get('magnitude', 0)
-        magnitude_probs = prob_result.get('magnitude_probs', [0.0] * 6)
+        probability, magnitude, magnitude_probs = parse_probability_result(prob_result)
+        print(f"Résultat parsé: prob={probability}, mag={magnitude}, probs={magnitude_probs}")
         
     except Exception as e:
         print(f"Erreur lors de la prédiction de probabilité: {e}")
-        probability = 0.0
-        magnitude = 0
-        magnitude_probs = [0.0] * 6
+        traceback.print_exc()
     
     # Prédire les dégâts
+    tornado_damage = 0.0
+    
     try:
+        print(f"Appel predict_damage pour lat={latitude}, lon={longitude}")
         damage_result = predict_damage(
             embedding=embedding,
             lat=latitude,
@@ -142,17 +227,23 @@ def calculate_risk_from_ml_models(latitude, longitude, time_utc=None):
             time_utc=time_utc,
             model_damage_dir="models_damage"
         )
-        tornado_damage = damage_result.get('tornado_magnitude', 0.0)
+        print(f"Résultat brut predict_damage: {damage_result} (type: {type(damage_result)})")
+        
+        tornado_damage = parse_damage_result(damage_result)
+        print(f"Résultat parsé: damage={tornado_damage}")
+        
     except Exception as e:
         print(f"Erreur lors de la prédiction de dégâts: {e}")
-        tornado_damage = 0.0
+        traceback.print_exc()
     
     # Calculer le score de risque combiné
     # Risk = Probability × (Magnitude/5) × (1 + Damage/10)
-    normalized_magnitude = magnitude / 5.0
+    normalized_magnitude = magnitude / 5.0 if magnitude > 0 else 0.1
     damage_factor = 1 + (tornado_damage / 10.0)
     risk_score = probability * normalized_magnitude * damage_factor
     risk_score = float(np.clip(risk_score, 0, 1))
+    
+    print(f"Score de risque final: {risk_score}")
     
     return {
         'risk_score': risk_score,
@@ -220,7 +311,6 @@ def calculate_risk():
     
     except Exception as e:
         print(f"Erreur: {str(e)}")
-        import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
@@ -373,6 +463,10 @@ def predict_detailed():
             model_damage_dir="models_damage"
         )
         
+        # Parser les résultats
+        probability, magnitude, magnitude_probs = parse_probability_result(prob_result)
+        tornado_magnitude = parse_damage_result(damage_result)
+        
         # Résultat complet
         ml_result = calculate_risk_from_ml_models(latitude, longitude, time_utc)
         
@@ -383,13 +477,13 @@ def predict_detailed():
             },
             'timestamp': time_utc,
             'probability_prediction': {
-                'probability': float(prob_result.get('probability', 0.0)),
-                'magnitude': int(prob_result.get('magnitude', 0)),
-                'magnitude_probs': [float(p) for p in prob_result.get('magnitude_probs', [])],
-                'ef_label': get_ef_scale_label(prob_result.get('magnitude', 0)),
+                'probability': probability,
+                'magnitude': magnitude,
+                'magnitude_probs': magnitude_probs,
+                'ef_label': get_ef_scale_label(magnitude),
             },
             'damage_prediction': {
-                'tornado_magnitude': float(damage_result.get('tornado_magnitude', 0.0)),
+                'tornado_magnitude': tornado_magnitude,
             },
             'combined_risk': {
                 'risk_score': ml_result['risk_score'],
@@ -399,7 +493,6 @@ def predict_detailed():
     
     except Exception as e:
         print(f"Erreur: {str(e)}")
-        import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
