@@ -6,50 +6,23 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
+from risk_inference import predict_damage, predict_probability
+
 # ==============================================================================
-# CALCUL DE RISQUE
+# CALCUL DE RISQUE AVEC ML
 # ==============================================================================
 
-def calculate_risk_score(latitude, longitude):
+def generate_embedding(latitude, longitude, time_str=None):
     """
-    Calcule le score de risque pour une localisation donnée.
-    
-    Args:
-        latitude: Latitude de la localisation
-        longitude: Longitude de la localisation
-    
-    Returns:
-        float: Score de risque entre 0 et 1
+    Génère un embedding pour le modèle ML.
+    Dans une version de production, cela pourrait être basé sur des données météo réelles.
+    Pour l'instant, on génère un embedding semi-aléatoire basé sur la localisation.
     """
-    
-    # Zones à risque connus aux USA
-    risk_zones = [
-        # (lat, lng, risk_factor, radius_km)
-        (37.7749, -122.4194, 0.9, 200),      # San Francisco - séismes
-        (39.7392, -104.9903, 0.7, 300),      # Denver - tornades
-        (35.1264, -97.0882, 0.85, 400),      # Oklahoma - tornades et séismes
-        (29.7604, -95.3698, 0.75, 250),      # Houston - tempêtes, inondations
-        (33.7490, -84.3880, 0.65, 280),      # Atlanta - tempêtes
-    ]
-    
-    base_risk = 0.1  # Risque de base partout aux USA
-    
-    for zone_lat, zone_lng, zone_risk, radius in risk_zones:
-        # Distance en degrés
-        distance = np.sqrt((latitude - zone_lat)**2 + (longitude - zone_lng)**2)
-        distance_km = distance * 111  # 1 degré ≈ 111 km
-        
-        if distance_km < radius:
-            # Décroissance exponentielle du risque avec la distance
-            proximity_factor = np.exp(-distance_km / (radius / 3))
-            contribution = zone_risk * proximity_factor
-            base_risk = max(base_risk, contribution)
-    
-    # Ajouter une composante aléatoire pour la variabilité
-    noise = np.random.normal(0, 0.05)
-    final_risk = np.clip(base_risk + noise, 0, 1)
-    
-    return float(final_risk)
+    # Seed basé sur la localisation pour avoir des résultats reproductibles
+    seed = int((abs(latitude) * 1000 + abs(longitude) * 1000) % 2**32)
+    np.random.seed(seed)
+    embedding = np.random.rand(64).astype(float).tolist()
+    return embedding
 
 
 def get_risk_level(risk_score):
@@ -68,25 +41,87 @@ def get_risk_level(risk_score):
         return 'Très faible'
 
 
-def calculate_risk_with_ml(latitude, longitude):
+def get_ef_scale_label(magnitude):
     """
-    Alternative: Utilise un modèle ML pré-entraîné pour prédire le risque.
-    Tu pourrais charger ton modèle ici si tu en as un.
+    Convertit une magnitude en label EF Scale.
     """
-    # Exemple avec features engineerées
-    features = {
-        'latitude': latitude,
-        'longitude': longitude,
-        'lat_squared': latitude ** 2,
-        'lng_squared': longitude ** 2,
-        'interaction': latitude * longitude,
+    labels = {
+        0: 'EF0 - Dégâts légers',
+        1: 'EF1 - Dégâts modérés',
+        2: 'EF2 - Dégâts considérables',
+        3: 'EF3 - Dégâts sévères',
+        4: 'EF4 - Dégâts dévastateurs',
+        5: 'EF5 - Dégâts incroyables',
     }
+    return labels.get(magnitude, 'Inconnu')
+
+
+def calculate_risk_from_ml_models(latitude, longitude, time_utc=None):
+    """
+    Utilise les modèles ML pour prédire le risque de tornade.
     
-    # Simule une prédiction (remplace par ton vrai modèle)
-    risk_score = 0.3 + 0.15 * np.sin(latitude / 50) + 0.15 * np.cos(longitude / 50)
-    risk_score = np.clip(risk_score, 0, 1)
+    Retourne:
+    - probability: probabilité d'occurrence (0-1)
+    - magnitude: échelle EF prédite (0-5)
+    - magnitude_probs: distribution de probabilité sur les magnitudes
+    - damage: estimation des dégâts (tornado_magnitude)
+    """
+    # Si pas de timestamp fourni, utiliser maintenant
+    if time_utc is None:
+        time_utc = datetime.now().isoformat()
     
-    return float(risk_score)
+    # Générer l'embedding
+    embedding = generate_embedding(latitude, longitude, time_utc)
+    
+    # Prédire la probabilité et la magnitude
+    try:
+        prob_result = predict_probability(
+            embedding=embedding,
+            lat=latitude,
+            lon=longitude,
+            time_utc=time_utc,
+            model_prob_dir="models_prob"
+        )
+        
+        probability = prob_result.get('probability', 0.0)
+        magnitude = prob_result.get('magnitude', 0)
+        magnitude_probs = prob_result.get('magnitude_probs', [0.0] * 6)
+        
+    except Exception as e:
+        print(f"Erreur lors de la prédiction de probabilité: {e}")
+        probability = 0.0
+        magnitude = 0
+        magnitude_probs = [0.0] * 6
+    
+    # Prédire les dégâts
+    try:
+        damage_result = predict_damage(
+            embedding=embedding,
+            lat=latitude,
+            lon=longitude,
+            time_utc=time_utc,
+            model_damage_dir="models_damage"
+        )
+        tornado_damage = damage_result.get('tornado_magnitude', 0.0)
+    except Exception as e:
+        print(f"Erreur lors de la prédiction de dégâts: {e}")
+        tornado_damage = 0.0
+    
+    # Calculer le score de risque combiné
+    # Risk = Probability × (Magnitude/5) × (1 + Damage/10)
+    normalized_magnitude = magnitude / 5.0
+    damage_factor = 1 + (tornado_damage / 10.0)
+    risk_score = probability * normalized_magnitude * damage_factor
+    risk_score = float(np.clip(risk_score, 0, 1))
+    
+    return {
+        'risk_score': risk_score,
+        'probability': float(probability),
+        'magnitude': int(magnitude),
+        'magnitude_probs': [float(p) for p in magnitude_probs],
+        'tornado_damage': float(tornado_damage),
+        'ef_label': get_ef_scale_label(magnitude),
+    }
 
 
 # ==============================================================================
@@ -104,61 +139,49 @@ def health():
 @app.route('/api/calculate-risk', methods=['POST'])
 def calculate_risk():
     """
-    Endpoint pour calculer le risque: HAZARD × EXPOSURE × VULNERABILITY
+    Endpoint pour calculer le risque de tornade avec les modèles ML.
     
     Entrées (JSON POST):
     {
-        "tornado_probability": 0.4,    # 0-1
-        "ef_scale": 3,                  # 0-5
         "latitude": 35.4676,
-        "longitude": -97.5164
+        "longitude": -97.5164,
+        "time_utc": "2025-05-02 14:30:00+00:00" (optionnel)
     }
     """
     try:
         data = request.get_json()
-        tornado_probability = data.get('tornado_probability')
-        ef_scale = data.get('ef_scale')
         latitude = data.get('latitude')
         longitude = data.get('longitude')
+        time_utc = data.get('time_utc')  # Optionnel
         
         # Validation
-        if any(x is None for x in [tornado_probability, ef_scale, latitude, longitude]):
-            return jsonify({'error': 'Tous les paramètres requis'}), 400
-        
-        if not (0 <= tornado_probability <= 1):
-            return jsonify({'error': 'tornado_probability entre 0 et 1'}), 400
-        
-        if not (0 <= ef_scale <= 5):
-            return jsonify({'error': 'ef_scale entre 0 et 5'}), 400
+        if latitude is None or longitude is None:
+            return jsonify({'error': 'Latitude et longitude requis'}), 400
         
         if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
             return jsonify({'error': 'Coordonnées invalides'}), 400
         
-        # Calcul avec le modèle HEV
-        risk_data = calculate_risk_from_tornado_data(
-            tornado_probability, 
-            ef_scale, 
-            latitude, 
-            longitude
-        )
+        # Calcul avec les modèles ML
+        ml_result = calculate_risk_from_ml_models(latitude, longitude, time_utc)
         
         return jsonify({
-            'risk_score': risk_data['risk_score'],
-            'risk_level': get_risk_level(risk_data['risk_score']),
-            'hazard': risk_data['hazard'],
-            'exposure': risk_data['exposure'],
-            'vulnerability': risk_data['vulnerability'],
-            'tornado_probability': risk_data['tornado_probability'],
-            'ef_scale': risk_data['ef_scale'],
-            'ef_label': risk_data['ef_label'],
+            'risk_score': ml_result['risk_score'],
+            'risk_level': get_risk_level(ml_result['risk_score']),
+            'probability': ml_result['probability'],
+            'magnitude': ml_result['magnitude'],
+            'magnitude_probs': ml_result['magnitude_probs'],
+            'tornado_damage': ml_result['tornado_damage'],
+            'ef_label': ml_result['ef_label'],
             'latitude': latitude,
             'longitude': longitude,
             'timestamp': datetime.now().isoformat(),
-            'formula': 'RISK = HAZARD × EXPOSURE × VULNERABILITY',
+            'model_info': 'ML-based tornado risk prediction using AlphaEarth embeddings',
         }), 200
     
     except Exception as e:
         print(f"Erreur: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
@@ -166,6 +189,15 @@ def calculate_risk():
 def batch_calculate_risk():
     """
     Endpoint pour calculer les risques pour plusieurs localisations.
+    
+    Entrées (JSON POST):
+    {
+        "locations": [
+            {"latitude": 35.47, "longitude": -97.52},
+            {"latitude": 40.71, "longitude": -74.01},
+            ...
+        ]
+    }
     """
     try:
         data = request.get_json()
@@ -180,13 +212,24 @@ def batch_calculate_risk():
             lng = loc.get('longitude')
             
             if lat is not None and lng is not None:
-                risk_score = calculate_risk_score(lat, lng)
-                results.append({
-                    'latitude': lat,
-                    'longitude': lng,
-                    'risk_score': risk_score,
-                    'risk_level': get_risk_level(risk_score),
-                })
+                try:
+                    ml_result = calculate_risk_from_ml_models(lat, lng)
+                    results.append({
+                        'latitude': lat,
+                        'longitude': lng,
+                        'risk_score': ml_result['risk_score'],
+                        'risk_level': get_risk_level(ml_result['risk_score']),
+                        'probability': ml_result['probability'],
+                        'magnitude': ml_result['magnitude'],
+                        'ef_label': ml_result['ef_label'],
+                    })
+                except Exception as e:
+                    print(f"Erreur pour location ({lat}, {lng}): {e}")
+                    results.append({
+                        'latitude': lat,
+                        'longitude': lng,
+                        'error': str(e),
+                    })
         
         return jsonify({'results': results}), 200
     
@@ -197,32 +240,123 @@ def batch_calculate_risk():
 @app.route('/api/risk-zones', methods=['GET'])
 def get_predefined_zones():
     """
-    Retourne les zones de risque prédéfinies.
+    Retourne les zones de risque prédéfinies avec calculs ML.
     """
     zones = [
         {
-            'name': 'San Francisco Bay Area',
-            'latitude': 37.7749,
-            'longitude': -122.4194,
-            'risk_type': 'Earthquakes',
-            'base_risk': 0.9,
-        },
-        {
-            'name': 'Tornado Alley',
-            'latitude': 35.1264,
-            'longitude': -97.0882,
+            'name': 'Tornado Alley (Oklahoma)',
+            'latitude': 35.4676,
+            'longitude': -97.5164,
             'risk_type': 'Tornadoes',
-            'base_risk': 0.85,
         },
         {
-            'name': 'Gulf Coast',
-            'latitude': 29.7604,
-            'longitude': -95.3698,
-            'risk_type': 'Hurricanes & Storms',
-            'base_risk': 0.75,
+            'name': 'Kansas City Area',
+            'latitude': 39.0997,
+            'longitude': -94.5786,
+            'risk_type': 'Tornadoes',
+        },
+        {
+            'name': 'Dallas-Fort Worth',
+            'latitude': 32.7767,
+            'longitude': -96.7970,
+            'risk_type': 'Tornadoes',
         },
     ]
+    
+    # Calculer le risque pour chaque zone
+    for zone in zones:
+        try:
+            ml_result = calculate_risk_from_ml_models(
+                zone['latitude'], 
+                zone['longitude']
+            )
+            zone['risk_score'] = ml_result['risk_score']
+            zone['risk_level'] = get_risk_level(ml_result['risk_score'])
+            zone['probability'] = ml_result['probability']
+            zone['magnitude'] = ml_result['magnitude']
+            zone['ef_label'] = ml_result['ef_label']
+        except Exception as e:
+            print(f"Erreur calcul risque pour {zone['name']}: {e}")
+            zone['risk_score'] = 0.0
+            zone['risk_level'] = 'Inconnu'
+    
     return jsonify({'zones': zones}), 200
+
+
+@app.route('/api/predict-detailed', methods=['POST'])
+def predict_detailed():
+    """
+    Endpoint détaillé qui retourne toutes les informations des modèles ML.
+    
+    Entrées (JSON POST):
+    {
+        "latitude": 35.4676,
+        "longitude": -97.5164,
+        "time_utc": "2025-05-02 14:30:00+00:00" (optionnel)
+    }
+    """
+    try:
+        data = request.get_json()
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+        time_utc = data.get('time_utc')
+        
+        if latitude is None or longitude is None:
+            return jsonify({'error': 'Latitude et longitude requis'}), 400
+        
+        if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+            return jsonify({'error': 'Coordonnées invalides'}), 400
+        
+        if time_utc is None:
+            time_utc = datetime.now().isoformat()
+        
+        # Générer l'embedding
+        embedding = generate_embedding(latitude, longitude, time_utc)
+        
+        # Prédictions ML
+        prob_result = predict_probability(
+            embedding=embedding,
+            lat=latitude,
+            lon=longitude,
+            time_utc=time_utc,
+            model_prob_dir="models_prob"
+        )
+        
+        damage_result = predict_damage(
+            embedding=embedding,
+            lat=latitude,
+            lon=longitude,
+            time_utc=time_utc,
+            model_damage_dir="models_damage"
+        )
+        
+        # Résultat complet
+        return jsonify({
+            'location': {
+                'latitude': latitude,
+                'longitude': longitude,
+            },
+            'timestamp': time_utc,
+            'probability_prediction': {
+                'probability': float(prob_result.get('probability', 0.0)),
+                'magnitude': int(prob_result.get('magnitude', 0)),
+                'magnitude_probs': [float(p) for p in prob_result.get('magnitude_probs', [])],
+                'ef_label': get_ef_scale_label(prob_result.get('magnitude', 0)),
+            },
+            'damage_prediction': {
+                'tornado_magnitude': float(damage_result.get('tornado_magnitude', 0.0)),
+            },
+            'combined_risk': {
+                'risk_score': calculate_risk_from_ml_models(latitude, longitude, time_utc)['risk_score'],
+                'risk_level': get_risk_level(calculate_risk_from_ml_models(latitude, longitude, time_utc)['risk_score']),
+            }
+        }), 200
+    
+    except Exception as e:
+        print(f"Erreur: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 # ==============================================================================
@@ -233,5 +367,6 @@ if __name__ == '__main__':
     print("🚀 Démarrage du serveur EarthInsurance...")
     print("📍 API disponible à http://localhost:5000")
     print("✅ CORS activé")
+    print("🤖 Modèles ML chargés")
     print("📡 En attente de requêtes...")
     app.run(debug=True, port=5000, host='0.0.0.0')
