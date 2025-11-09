@@ -104,29 +104,57 @@ def health():
 @app.route('/api/calculate-risk', methods=['POST'])
 def calculate_risk():
     """
-    Endpoint pour calculer le risque à une localisation donnée.
+    Endpoint pour calculer le risque: HAZARD × EXPOSURE × VULNERABILITY
+    
+    Entrées (JSON POST):
+    {
+        "tornado_probability": 0.4,    # 0-1
+        "ef_scale": 3,                  # 0-5
+        "latitude": 35.4676,
+        "longitude": -97.5164
+    }
     """
     try:
         data = request.get_json()
+        tornado_probability = data.get('tornado_probability')
+        ef_scale = data.get('ef_scale')
         latitude = data.get('latitude')
         longitude = data.get('longitude')
         
         # Validation
-        if latitude is None or longitude is None:
-            return jsonify({'error': 'Latitude et longitude requises'}), 400
+        if any(x is None for x in [tornado_probability, ef_scale, latitude, longitude]):
+            return jsonify({'error': 'Tous les paramètres requis'}), 400
+        
+        if not (0 <= tornado_probability <= 1):
+            return jsonify({'error': 'tornado_probability entre 0 et 1'}), 400
+        
+        if not (0 <= ef_scale <= 5):
+            return jsonify({'error': 'ef_scale entre 0 et 5'}), 400
         
         if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
             return jsonify({'error': 'Coordonnées invalides'}), 400
         
-        # Calcul du risque
-        risk_score = calculate_risk_score(latitude, longitude)
+        # Calcul avec le modèle HEV
+        risk_data = calculate_risk_from_tornado_data(
+            tornado_probability, 
+            ef_scale, 
+            latitude, 
+            longitude
+        )
         
         return jsonify({
-            'risk_score': risk_score,
-            'risk_level': get_risk_level(risk_score),
+            'risk_score': risk_data['risk_score'],
+            'risk_level': get_risk_level(risk_data['risk_score']),
+            'hazard': risk_data['hazard'],
+            'exposure': risk_data['exposure'],
+            'vulnerability': risk_data['vulnerability'],
+            'tornado_probability': risk_data['tornado_probability'],
+            'ef_scale': risk_data['ef_scale'],
+            'ef_label': risk_data['ef_label'],
             'latitude': latitude,
             'longitude': longitude,
             'timestamp': datetime.now().isoformat(),
+            'formula': 'RISK = HAZARD × EXPOSURE × VULNERABILITY',
         }), 200
     
     except Exception as e:
