@@ -1,6 +1,6 @@
 # EarthInsurance
 
-Tornado risk prediction with XGBoost using satellite embeddings and contextual spatiotemporal features. Ships a Flask API and a React + Leaflet map UI.
+Tornado risk prediction with XGBoost using AlphaEarth embeddings, contextual spatiotemporal features and risk features(occurence and magnitude with FEMA dataset). Ships a Flask API and a React + Leaflet map UI.
 
 ## Quickstart
 
@@ -44,19 +44,19 @@ Other endpoints: `/api/health`, `/api/batch-calculate-risk`, `/api/risk-zones`, 
 
 - Probability (occurrence):
   ```
-  python Backend/tornado_probability.py train --train path/to/train.csv --test path/to/test.csv --outdir Backend/models_prob
+  py Backend/tornado_probability.py train --train Backend/data/train.csv --test Backend/data/test.csv --outdir Backend/models_prob
   ```
 - Magnitude (EF classifier):
   ```
-  python Backend/tornado_damage.py train --train path/to/train_i.csv --test path/to/test_i.csv --outdir Backend/models_damage
+  py Backend/tornado_damage.py train --train Backend/data/train_i.csv --test Backend/data/test_i.csv --outdir Backend/models_damage
   ```
 
-CSV schema: `lat, lon, time_utc, f1..f64` (+ `label_occ` for probability, `label_magn` for magnitude). Time format: `YYYY-MM-DD HH:MM:SS+HH:MM` or `...Z`.
+CSV schema: `lat, lon, time_utc, f1..f64` (+ `??` for probability, `??` for magnitude). Time format: `YYYY-MM-DD HH:MM:SS+HH:MM` or `YYYY-MM-DDTHH:MM:SSZ`.
 
 ## Repo Layout
 
 - `Backend/api.py` Flask API
-- `Backend/risk_inference.py` model loading + features
+- `Backend/risk_inference.py` model loading 
 - `Backend/models_prob/` and `Backend/models_damage/` pretrained models
 - `Frontend/` React app (Vite + Leaflet)
 
@@ -66,6 +66,7 @@ CSV schema: `lat, lon, time_utc, f1..f64` (+ `label_occ` for probability, `label
 - `Backend/risk_inference.py`: Loads XGBoost models, builds geo/time features, and returns probability and EF magnitude predictions.
 - `Backend/tornado_probability.py`: Trains the tornado occurrence classifier and saves the model/metadata (CLI usage).
 - `Backend/tornado_damage.py`: Trains the EF magnitude classifier and saves the model/metadata (CLI usage).
+- `Backend/tornado_loss.py`: Computes a unitless risk score R = p * v(EF) using a simple MDR table by occupancy (residential/commercial/industrial); includes a small CLI for single‑point scoring.
 - `Backend/generate_features_from_events.py`: Generates positives/negatives from `events.csv` and samples AlphaEarth embeddings via GEE (exports to Drive/GCS/local).
 - `Backend/generate_features_from_events_nopandas.py`: Minimal no‑pandas generator that writes `features.csv` (~40% positives) for quick tests.
 - `Backend/model.py`: Earth Engine example that fetches a 64‑dim AlphaEarth embedding at a given point.

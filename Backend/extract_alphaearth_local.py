@@ -1,300 +1,377 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Batch feature extraction from events.csv using Google Satellite Embedding (AlphaEarth) on GEE.
-Local-only version: NO Drive/GCS exports. Uses server-side sampleRegions per year,
-then downloads in local pages with tqdm progress bars and detailed logs.
+Génère un CSV à partir de events.csv avec les vecteurs AlphaEarth.
 
-- Lit data/events.csv, construit les positifs (milieu du segment, horodaté UTC).
-- Génère des négatifs aléatoires hors buffer 3 km des événements, et hors fenêtre +/-3h (au pas 1h).
-- Concatène (positifs + négatifs) -> FeatureCollection {lat, lon, time_utc, year, split}.
-- Pour chaque année -> sampleRegions(64D) -> filtre notNull(f1) -> téléchargement paginé local.
-
-Dépendances :
-  pip install earthengine-api tqdm
-  ee.Authenticate() puis ee.Initialize(project='votre-project-id')
+Pour chaque tornade dans events.csv:
+  - Récupère le vecteur AlphaEarth de l'année AVANT l'événement
+  - Extrait le label (1 = tornade) et la magnitude (EF_Scale)
+  
+Format de sortie: lat, lon, time_utc, f1...f64, label, magnitude
 """
 
-import sys, os, csv, argparse, time, math
+import ee
+import sys
+import csv
 from datetime import datetime, timezone
-from typing import List, Optional
+from collections import defaultdict
+from typing import List, Dict, Optional
 
-import ee  # pip install earthengine-api
-from tqdm import tqdm  # pip install tqdm
-
+# Configuration AlphaEarth
 COLLECTION_ID = 'GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL'
-US_LAT_MIN, US_LAT_MAX = 24.5, 49.5
-US_LON_MIN, US_LON_MAX = -125.0, -66.0
-EMB_BANDS = [f'embedding_{i}' for i in range(64)]  # bandes explicites (ancien schéma)
+BAND_PREFIX = 'A'
+DIMS = 64
+SCALE_M = 30.0
 
-def log(msg: str):
-    ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    print(f'[{ts}] {msg}', flush=True)
+def log(msg):
+    """Affiche un message avec timestamp."""
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(f"[{ts}] {msg}", flush=True)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="AlphaEarth local extractor (no Drive/GCS).")
-    p.add_argument('--events', default='data/events.csv', help='Chemin vers events.csv')
-    p.add_argument('--out', default='data/features.csv', help='Chemin CSV de sortie (unique, append)')
-    p.add_argument('--dims', type=int, default=64, help='Dimensions a exporter (<=64)')
-    p.add_argument('--scale', type=float, default=30.0, help='Scale (m) pour sampleRegions')
-    p.add_argument('--page-size', type=int, default=1000, help='Taille de page pour le rapatriement local')
-    p.add_argument('--project', default=None, help='Project ID GEE pour ee.Initialize(project=...)')
-    p.add_argument('--neg-ratio-pos', type=float, default=0.6, help='Fraction de negatifs desiree (=1-pos). Ex: 0.6 -> 40% pos')
-    p.add_argument('--seed', type=int, default=123, help='Seed pour points aleatoires negatifs')
-    return p.parse_args()
-
-def safe_float(v) -> Optional[float]:
+def init_gee():
+    """Initialise Google Earth Engine."""
+    log("Initialisation GEE...")
     try:
-        return float(v)
+        ee.Initialize()
+        log("✅ GEE initialisé")
     except Exception:
-        return None
+        log("Authentification nécessaire...")
+        ee.Authenticate()
+        ee.Initialize(project='gen-lang-client-0546266030')
+        log("✅ Authentification réussie")
 
-def parse_time_utc(s: str) -> Optional[datetime]:
-    s = (s or '').strip()
+def parse_datetime(s: str) -> Optional[datetime]:
+    """Parse une date UTC."""
+    s = (s or "").strip()
     if not s:
         return None
-    # Plusieurs formats courants
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
-        try:
-            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            pass
-    # ISO 8601 generique
+    
     try:
-        if s.endswith('Z'):
-            return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(timezone.utc)
-        dt = datetime.fromisoformat(s)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        if "T" in s:
+            if s.endswith("Z"):
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+            dt = datetime.fromisoformat(s)
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        else:
+            # Format: YYYY-MM-DD HH:MM:SS
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
-def init_ee(project: Optional[str]):
-    log('Initializing Earth Engine…')
-    try:
-        if project:
-            ee.Initialize(project=project)
-        else:
-            ee.Initialize()
-    except Exception as e:
-        log('EE init failed, attempting interactive auth…')
-        ee.Authenticate()
-        if project:
-            ee.Initialize(project=project)
-        else:
-            ee.Initialize()
-    log('EE ready.')
-
-def load_events(path: str):
-    log(f'Loading events from {path} …')
-    try:
-        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
-            rdr = csv.DictReader(f)
-            rows = list(rdr)
-            fields = [c.strip() for c in (rdr.fieldnames or [])]
-    except FileNotFoundError:
-        print(f'ERROR: not found: {path}', file=sys.stderr)
-        sys.exit(1)
-    if not rows:
-        print('ERROR: events.csv empty.', file=sys.stderr)
-        sys.exit(1)
-    return rows, fields
-
-def pick_cols(fields: List[str]):
-    lc = {c.lower(): c for c in fields}
-    def get_col(cands: List[str], default=None):
-        for c in cands:
-            if c.lower() in lc:
-                return lc[c.lower()]
-        return default
-    col_slat = get_col(['start_lat','start latitude','start_latitude','slat']) or 'Start_Lat'
-    col_slon = get_col(['start_lon','start longitude','start_longitude','slon']) or 'Start_Lon'
-    col_elat = get_col(['end_lat','end latitude','end_latitude','elat']) or 'End_Lat'
-    col_elon = get_col(['end_lon','end longitude','end_longitude','elon']) or 'End_Lon'
-    col_date = get_col(['begin_time_utc','date','datetime','time','start_time']) or 'Date'
-    return col_slat, col_slon, col_elat, col_elon, col_date
-
-def build_pos_fc(rows, col_slat, col_slon, col_elat, col_elon, col_date):
-    feats = []
-    years = set()
-    ok = 0
-    for r in rows:
-        slat, slon = safe_float(r.get(col_slat)), safe_float(r.get(col_slon))
-        elat, elon = safe_float(r.get(col_elat)), safe_float(r.get(col_elon))
-        dt = parse_time_utc(r.get(col_date))
-        if None in (slat, slon, elat, elon) or dt is None:
-            continue
-        lat = (slat + elat)/2.0
-        lon = (slon + elon)/2.0
-        y = dt.year
-        years.add(y)
-        props = {
-            'lat': lat, 'lon': lon,
-            'time_utc': dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            'year': y, 'split': 'pos'
-        }
-        feats.append(ee.Feature(ee.Geometry.Point([lon, lat]), props))
-        ok += 1
-    fc = ee.FeatureCollection(feats)
-    log(f'Parsed positives: {ok}')
-    if ok == 0:
-        print('ERROR: No valid events after parsing.', file=sys.stderr)
-        sys.exit(1)
-    return fc, years
-
-def build_safe_region_and_times(rows, col_slat, col_slon, col_elat, col_elon, col_date):
-    # Buffer 3 km autour des segments
-    line_feats = []
-    pos_times = []
-    for r in rows:
-        slat, slon = safe_float(r.get(col_slat)), safe_float(r.get(col_slon))
-        elat, elon = safe_float(r.get(col_elat)), safe_float(r.get(col_elon))
-        dt = parse_time_utc(r.get(col_date))
-        if None not in (slat, slon, elat, elon):
-            line_feats.append(ee.Feature(ee.Geometry.LineString([[slon, slat],[elon, elat]])))
-        if dt is not None:
-            pos_times.append(dt)
-    if not pos_times:
-        print('ERROR: No valid event times.', file=sys.stderr); sys.exit(1)
-    lines_fc = ee.FeatureCollection(line_feats) if line_feats else ee.FeatureCollection([])
-    buffered_union = lines_fc.geometry().buffer(3000)
-    us_geom = ee.Geometry.Rectangle([US_LON_MIN, US_LAT_MIN, US_LON_MAX, US_LAT_MAX], None, False)
-    safe_region = us_geom.difference(buffered_union, 1)
-    min_dt, max_dt = min(pos_times), max(pos_times)
-    return safe_region, min_dt, max_dt
-
-def build_neg_fc(n_neg: int, safe_region, min_dt, max_dt, seed: int):
-    span_hours = max(0, int((max_dt - min_dt).total_seconds() // 3600))
-    allowed = list(range(span_hours + 1)) if span_hours > 0 else [0]
-    allowed_list = ee.List(allowed)
-    allowed_size = allowed_list.size()
-    min_date = ee.Date(min_dt.isoformat())
-
-    log(f'Generating negatives: {n_neg} (seed={seed})')
-    neg_fc = ee.FeatureCollection.randomPoints(safe_region, n_neg, seed)
-    def _neg_props(f):
-        coords = f.geometry().coordinates()  # [lon, lat]
-        idx = (ee.Number(coords.get(0)).multiply(1000000).abs()
-               .add(ee.Number(coords.get(1)).multiply(1000000).abs())
-               .toInt().mod(allowed_size))
-        off_h = ee.Number(allowed_list.get(idx))
-        dt = min_date.advance(off_h, 'hour')
-        return f.set({
-            'lat': coords.get(1),
-            'lon': coords.get(0),
-            'time_utc': dt.format("YYYY-MM-dd'T'HH:mm:ss'Z'"),
-            'year': ee.Number.parse(dt.format('YYYY')),
-            'split': 'neg'
-        })
-    return neg_fc.map(_neg_props)
-
-def sample_year_to_csv(year: int, all_fc: ee.FeatureCollection, out_csv: str, dims: int, scale_m: float, page_size: int):
-    start = ee.Date.fromYMD(year, 1, 1)
-    end   = start.advance(1, 'year')
-    img = ee.ImageCollection(COLLECTION_ID).filterDate(start, end).first()
-    img = ee.Image(ee.Algorithms.If(
-        img, img,
-        ee.ImageCollection(COLLECTION_ID)
-          .filterDate(start.advance(-2,'year'), end.advance(2,'year'))
-          .sort('system:time_start').first()
-    ))
-    img = ee.Image(img)
-    # Certaines versions de la collection fournissent des bandes 'embedding_0..63',
-    # d'autres 'A00..A63'. On sélectionne dynamiquement selon les bandes présentes.
-    band_names = img.bandNames()
-    has_embedding = band_names.contains('embedding_0')
-    has_A00 = band_names.contains('A00')
-
-    emb_select_embed = img.select(EMB_BANDS[:dims])
-    a_bands = [f"A{str(i).zfill(2)}" for i in range(dims)]
-    emb_select_A = img.select(a_bands)
-
-    emb_img = ee.Image(
-        ee.Algorithms.If(
-            has_embedding,
-            emb_select_embed,
-            ee.Algorithms.If(has_A00, emb_select_A, img)
-        )
-    )
-
-    emb = emb_img.rename([f'f{i}' for i in range(1, dims+1)])
-
-    year_fc = all_fc.filter(ee.Filter.eq('year', year))
-    samp = emb.sampleRegions(collection=year_fc, scale=scale_m, geometries=False, tileScale=2)
-    samp = samp.filter(ee.Filter.notNull(['f1']))
-
-    total = int(samp.size().getInfo() or 0)
-    log(f'Year {year}: {total} rows to fetch -> {out_csv}')
-    if total == 0:
+def parse_magnitude(mag_val) -> int:
+    """
+    Parse la magnitude d'une tornade.
+    Retourne un entier entre 0 et 5 (échelle EF).
+    """
+    if mag_val is None or str(mag_val).strip() == "":
         return 0
+    
+    try:
+        # Essayer de convertir directement en int
+        mag = int(float(mag_val))
+        # Clamp entre 0 et 5
+        return max(0, min(5, mag))
+    except (ValueError, TypeError):
+        # Si c'est une chaîne comme "EF2", "F3", etc.
+        mag_str = str(mag_val).strip().upper()
+        if mag_str.startswith("EF"):
+            mag_str = mag_str[2:]
+        elif mag_str.startswith("F"):
+            mag_str = mag_str[1:]
+        
+        try:
+            mag = int(mag_str)
+            return max(0, min(5, mag))
+        except ValueError:
+            return 0
 
-    selectors = ['lat','lon','time_utc','split'] + [f'f{i}' for i in range(1, dims+1)]
-    write_header = not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0
-    if os.path.dirname(out_csv):
-        os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    with open(out_csv, 'a', encoding='utf-8', newline='') as fcsv:
-        w = csv.writer(fcsv)
-        if write_header:
-            w.writerow(selectors)
+def load_events(csv_path: str):
+    """Charge les événements de events.csv avec leur magnitude."""
+    log(f"Chargement de {csv_path}...")
+    
+    try:
+        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            fields = reader.fieldnames or []
+    except FileNotFoundError:
+        print(f"❌ Fichier non trouvé: {csv_path}")
+        sys.exit(1)
+    
+    log(f"Colonnes disponibles: {fields}")
+    
+    # Détection flexible des colonnes
+    fields_lc = {f.strip().lower(): f for f in fields}
+    
+    def get_col(candidates):
+        for c in candidates:
+            if c.lower() in fields_lc:
+                return fields_lc[c.lower()]
+        return None
+    
+    col_slat = get_col(['start_lat', 'start latitude', 'slat', 'latitude', 'lat'])
+    col_slon = get_col(['start_lon', 'start longitude', 'slon', 'longitude', 'lon'])
+    col_elat = get_col(['end_lat', 'end latitude', 'elat'])
+    col_elon = get_col(['end_lon', 'end longitude', 'elon'])
+    col_date = get_col(['date', 'begin_time_utc', 'datetime', 'time'])
+    
+    # Pour la magnitude, essayer plusieurs colonnes
+    col_magnitude = get_col(['magnitude', 'ef_scale', 'tor_f_scale', 'f_scale', 'scale'])
+    
+    log(f"\nColonnes détectées:")
+    log(f"  - Start Lat: {col_slat}")
+    log(f"  - Start Lon: {col_slon}")
+    log(f"  - End Lat: {col_elat}")
+    log(f"  - End Lon: {col_elon}")
+    log(f"  - Date: {col_date}")
+    log(f"  - Magnitude: {col_magnitude}")
+    
+    if not all([col_slat, col_slon, col_date]):
+        print(f"❌ Colonnes essentielles manquantes!")
+        sys.exit(1)
+    
+    # Parser les événements
+    events = []
+    magnitude_counts = defaultdict(int)
+    skipped = 0
+    
+    for r in rows:
+        try:
+            slat = float(r[col_slat]) if r.get(col_slat, "") else None
+            slon = float(r[col_slon]) if r.get(col_slon, "") else None
+            
+            # Si on a End_Lat/End_Lon, calculer le point central
+            if col_elat and col_elon:
+                elat = float(r[col_elat]) if r.get(col_elat, "") else slat
+                elon = float(r[col_elon]) if r.get(col_elon, "") else slon
+            else:
+                elat = slat
+                elon = slon
+            
+            dt = parse_datetime(r.get(col_date, ""))
+            
+            # Parser la magnitude
+            if col_magnitude:
+                magnitude = parse_magnitude(r.get(col_magnitude, ""))
+            else:
+                magnitude = 0
+            
+            if None in (slat, slon, elat, elon) or dt is None:
+                skipped += 1
+                continue
+            
+            # Point central de l'événement
+            lat = (slat + elat) / 2.0
+            lon = (slon + elon) / 2.0
+            
+            magnitude_counts[magnitude] += 1
+            
+            events.append({
+                'lat': lat,
+                'lon': lon,
+                'time': dt,
+                'year': dt.year,
+                'label': 1,  # Toujours 1 pour une tornade
+                'magnitude': magnitude
+            })
+        except Exception as e:
+            skipped += 1
+            continue
+    
+    log(f"\n✅ {len(events)} événements chargés ({skipped} ignorés)")
+    log(f"\nDistribution des magnitudes:")
+    for mag in sorted(magnitude_counts.keys()):
+        log(f"  EF{mag}: {magnitude_counts[mag]} ({magnitude_counts[mag]/len(events)*100:.1f}%)")
+    
+    return events
 
-        offset = 0
-        pbar = tqdm(total=total, desc=f'Year {year}', unit='row')
-        def fetch_batch(fc, size, start_idx, tries=3):
-            last_err = None
-            for k in range(tries):
-                try:
-                    batch = ee.FeatureCollection(fc.toList(size, start_idx))
-                    data = (batch.getInfo() or {}).get('features', [])
-                    return data
-                except Exception as e:
-                    last_err = e
-                    time.sleep(2 * (k+1))
-            raise last_err
+def get_year_mosaic(year: int):
+    """Récupère la mosaïque AlphaEarth pour une année."""
+    col = ee.ImageCollection(COLLECTION_ID)
+    start = ee.Date.fromYMD(year, 1, 1)
+    end = start.advance(1, 'year')
+    
+    filtered = col.filterDate(start, end)
+    img = filtered.mosaic()
+    
+    # Fallback si année non disponible
+    img = ee.Image(ee.Algorithms.If(
+        filtered.size().gt(0),
+        img,
+        col.filterDate(
+            start.advance(-3, 'year'),
+            end.advance(3, 'year')
+        ).mosaic()
+    ))
+    
+    return ee.Image(img)
 
-        while offset < total:
-            feats = fetch_batch(samp, page_size, offset)
-            if not feats:
-                break
-            for feat in feats:
+def sample_points_by_year(all_points: List[dict], lookback_years: int = 1):
+    """
+    Échantillonne tous les points avec AlphaEarth, groupés par année.
+    
+    Pour chaque point, utilise l'image de (year - lookback_years).
+    """
+    log(f"\nGroupement des points par année (lookback={lookback_years})...")
+    
+    # Grouper par année d'échantillonnage
+    points_by_sample_year = defaultdict(list)
+    for idx, pt in enumerate(all_points):
+        sample_year = pt['year'] - lookback_years
+        points_by_sample_year[sample_year].append((idx, pt))
+    
+    log(f"Années à échantillonner: {sorted(points_by_sample_year.keys())}")
+    
+    results = {}
+    
+    for sample_year in sorted(points_by_sample_year.keys()):
+        year_points = points_by_sample_year[sample_year]
+        log(f"\n📅 Année {sample_year}: {len(year_points)} points")
+        
+        # Récupérer l'image
+        img = get_year_mosaic(sample_year)
+        
+        # Vérifier les bandes
+        band_names = img.bandNames().getInfo()
+        log(f"   Bandes disponibles: {band_names[:5]}... ({len(band_names)} total)")
+        
+        # Sélectionner les bandes A00-A63 et renommer en f1-f64
+        band_list = [f'{BAND_PREFIX}{i:02d}' for i in range(DIMS)]
+        img = img.select(band_list).rename([f'f{i}' for i in range(1, DIMS + 1)])
+        
+        # Créer FeatureCollection
+        features = []
+        for idx, pt in year_points:
+            features.append(ee.Feature(
+                ee.Geometry.Point([pt['lon'], pt['lat']]),
+                {'idx': idx}
+            ))
+        
+        fc = ee.FeatureCollection(features)
+        
+        # Échantillonner
+        log(f"   Échantillonnage...")
+        sampled = img.sampleRegions(
+            collection=fc,
+            scale=SCALE_M,
+            geometries=False,
+            tileScale=4
+        )
+        
+        # Récupérer les résultats
+        log(f"   Téléchargement...")
+        sampled_list = sampled.getInfo()
+        
+        if sampled_list and 'features' in sampled_list:
+            n_results = len(sampled_list['features'])
+            log(f"   ✅ {n_results} résultats reçus")
+            
+            for feat in sampled_list['features']:
                 props = feat.get('properties', {})
-                w.writerow([props.get(k, '') for k in selectors])
-            offset += len(feats)
-            pbar.update(len(feats))
-        pbar.close()
-    log(f'Year {year}: done.')
-    return total
+                idx = props.get('idx')
+                if idx is not None:
+                    results[idx] = props
+        else:
+            log(f"   ⚠️  Aucun résultat")
+    
+    return results
+
+def write_output_csv(all_points: List[dict], results: Dict, output_path: str):
+    """
+    Écrit le CSV de sortie.
+    
+    Format: lat, lon, time_utc, f1...f64, label, magnitude
+    """
+    log(f"\nÉcriture de {output_path}...")
+    
+    # Header
+    header = ['lat', 'lon', 'time_utc'] + [f'f{i}' for i in range(1, DIMS + 1)] + ['label', 'magnitude']
+    
+    valid_count = 0
+    invalid_count = 0
+    
+    with open(output_path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        
+        for idx, pt in enumerate(all_points):
+            props = results.get(idx, {})
+            
+            # Extraire les features
+            features = []
+            for i in range(1, DIMS + 1):
+                val = props.get(f'f{i}')
+                if val is not None:
+                    try:
+                        features.append(float(val))
+                    except:
+                        features.append(float('nan'))
+                else:
+                    features.append(float('nan'))
+            
+            # Vérifier si on a des données valides
+            n_valid = sum(1 for f in features if f == f)  # f==f est False pour NaN
+            
+            if n_valid > 0:
+                valid_count += 1
+            else:
+                invalid_count += 1
+            
+            # Écrire la ligne avec label et magnitude
+            row = [
+                f"{pt['lat']:.6f}",
+                f"{pt['lon']:.6f}",
+                pt['time'].strftime('%Y-%m-%dT%H:%M:%SZ')
+            ] + [f"{f:.6f}" if f == f else "" for f in features] + [pt['label'], pt['magnitude']]
+            
+            writer.writerow(row)
+    
+    log(f"\n✅ Terminé!")
+    log(f"   Points valides: {valid_count}/{len(all_points)}")
+    log(f"   Points sans données: {invalid_count}/{len(all_points)}")
 
 def main():
-    args = parse_args()
-    dims = max(1, min(int(args.dims), 64))
-    if os.path.dirname(args.out):
-        os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    """Fonction principale."""
+    print("\n" + "="*80)
+    print("  GÉNÉRATION CSV depuis events.csv - Vecteurs AlphaEarth")
+    print("="*80)
+    
+    # Configuration
+    EVENTS_CSV = 'data/events.csv'
+    OUTPUT_CSV = 'data/events_with_vectors.csv'
+    LOOKBACK_YEARS = 1  # Utiliser l'image de l'année AVANT l'événement
+    
+    # 1. Initialisation
+    init_gee()
+    
+    # 2. Charger les événements
+    events = load_events(EVENTS_CSV)
+    
+    if not events:
+        print("❌ Aucun événement valide trouvé")
+        sys.exit(1)
+    
+    log(f"\n📊 Total: {len(events)} événements (tornades)")
+    
+    # 3. Échantillonner avec AlphaEarth
+    results = sample_points_by_year(events, lookback_years=LOOKBACK_YEARS)
+    
+    # 4. Écrire le CSV
+    write_output_csv(events, results, OUTPUT_CSV)
+    
+    # 5. Résumé final
+    print("\n" + "="*80)
+    print("✅ GÉNÉRATION TERMINÉE")
+    print("="*80)
+    print(f"Fichier d'entrée: {EVENTS_CSV}")
+    print(f"Fichier de sortie: {OUTPUT_CSV}")
+    print(f"Total de tornades: {len(events)}")
+    print(f"Lookback: {LOOKBACK_YEARS} an(s)")
+    print(f"\nFormat: lat, lon, time_utc, f1...f64, label, magnitude")
+    print(f"  - label: 1 (tornade)")
+    print(f"  - magnitude: 0-5 (échelle EF)")
+    print()
 
-    init_ee(args.project)
-    rows, fields = load_events(args.events)
-    col_slat, col_slon, col_elat, col_elon, col_date = pick_cols(fields)
-
-    pos_fc, years_local = build_pos_fc(rows, col_slat, col_slon, col_elat, col_elon, col_date)
-    safe_region, min_dt, max_dt = build_safe_region_and_times(rows, col_slat, col_slon, col_elat, col_elon, col_date)
-
-    n_pos = int(pos_fc.size().getInfo() or 0)
-    pos_frac = 1.0 - float(args.neg_ratio_pos)
-    pos_frac = max(0.05, min(pos_frac, 0.95))
-    target_total = int(round(n_pos / pos_frac))
-    n_neg = max(target_total - n_pos, 0)
-    log(f'Negatives planned: {n_neg} (target pos fraction ~{int(pos_frac*100)}%)')
-
-    neg_fc = build_neg_fc(n_neg, safe_region, min_dt, max_dt, args.seed)
-    all_fc = pos_fc.merge(neg_fc)
-
-    years = sorted(list(years_local)) or list(range(min_dt.year, max_dt.year+1))
-    log(f'Years to process: {years}')
-
-    total_rows = 0
-    for y in years:
-        total_rows += sample_year_to_csv(y, all_fc, args.out, dims, args.scale, args.page_size)
-    log(f'All done. Total rows written: {total_rows} -> {args.out}')
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

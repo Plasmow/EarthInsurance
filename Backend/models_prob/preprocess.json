@@ -75,5 +75,9 @@
   ],
   "embedding_dim": 64,
   "time_format": "YYYY-MM-DD HH:MM:SS+HH:MM",
+<<<<<<< HEAD
   "created_utc": "2025-11-09T12:44:37.091620Z"
+=======
+  "created_utc": "2025-11-09T14:55:41.335076Z"
+>>>>>>> main
 }
