@@ -217,3 +217,39 @@ def predict_all(
 
 
 # No module-level test execution; import-only module.
+#exemple: 
+
+def test_few_examples():
+    for i in range(100):
+        embedding = np.random.rand(64).tolist()
+        lat = np.random.uniform(-90.0, 90.0)
+        lon = np.random.uniform(-180.0, 180.0)
+        time_utc = "2025-05-02 14:30:00+00:00"
+        prob = predict_probability(embedding, lat, lon, time_utc)
+        damage = predict_damage(embedding, lat, lon, time_utc)
+        all_res = predict_all(embedding, lat, lon, time_utc)
+        assert 0.0 <= prob <= 1.0
+        assert "magnitude_probs" in damage
+        assert "magnitude" in all_res or "magnitude_probs" in all_res
+        magnitude= all_res.get("magnitude")
+        if magnitude!=0:
+            print(f"Example {i+1}: prob={prob:.4f}, damage={damage}, all={all_res}")
+        
+test_few_examples()
+        
+    
+data_example= {
+    "embedding": [0.1]*64, 
+    "lat": 40.43685,
+    "lon": -90.195,
+    "time_utc": "2025-05-02 14:30:00+00:00",
+}
+
+result = predict_all(    
+    embedding=data_example["embedding"],
+    lat=data_example["lat"],
+    lon=data_example["lon"],
+    time_utc=data_example["time_utc"],
+)
+
+print(result)

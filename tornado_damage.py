@@ -102,9 +102,24 @@ def train_damage(
     os.makedirs(outdir, exist_ok=True)
     (X_tr, y_tr, X_te, y_te, feature_names) = _load_train_test(train_csv, test_csv)
 
-    # Prepare multiclass labels 0..5
-    y_tr = pd.to_numeric(y_tr, errors="coerce").fillna(0.0).astype(int).clip(lower=0, upper=5)
-    y_te = pd.to_numeric(y_te, errors="coerce").fillna(0.0).astype(int).clip(lower=0, upper=5)
+    # Prepare multiclass labels; infer classes present in training set
+    y_tr = pd.to_numeric(y_tr, errors="coerce").fillna(0.0).astype(int).clip(lower=0)
+    y_te = pd.to_numeric(y_te, errors="coerce").fillna(0.0).astype(int).clip(lower=0)
+    present_classes = np.unique(y_tr.values)
+    present_classes = np.sort(present_classes)
+    num_class = int(len(present_classes))
+    if num_class < 2:
+        raise ValueError("Need at least 2 classes present in training labels for multiclass.")
+
+    # Compute class frequencies for weighting (inverse frequency, normalized)
+    classes = present_classes
+    freq = np.array([(y_tr == c).sum() for c in classes], dtype=float)
+    # Avoid division by zero; if class absent set minimal frequency
+    freq = np.where(freq==0, 1e-6, freq)
+    inv = 1.0 / freq
+    class_weights = inv / inv.sum() * len(classes)  # scaled so average weight ~1
+    cw_map = {c: class_weights[i] for i,c in enumerate(classes)}
+    sample_weight = np.array([cw_map[v] for v in y_tr], dtype=float)
 
     clf = XGBClassifier(
         n_estimators=5000,
@@ -115,21 +130,21 @@ def train_damage(
         min_child_weight=2.0,
         reg_lambda=1.5,
         objective="multi:softprob",
-        num_class=6,
+        num_class=num_class,
         eval_metric="mlogloss",
         tree_method=_tree_method(use_gpu),
         random_state=random_state,
         n_jobs=0,
     )
     # Train without early stopping for broader xgboost version compatibility
-    clf.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+    clf.fit(X_tr, y_tr, sample_weight=sample_weight, eval_set=[(X_te, y_te)], verbose=False)
 
     proba = clf.predict_proba(X_te)
     y_pred = np.asarray(proba).argmax(axis=1)
     acc = float(accuracy_score(y_te, y_pred))
     macro_f1 = float(f1_score(y_te, y_pred, average="macro"))
     try:
-        ll = float(log_loss(y_te, proba, labels=[0,1,2,3,4,5]))
+        ll = float(log_loss(y_te, proba, labels=present_classes.tolist()))
     except Exception:
         ll = float(log_loss(y_te, proba))
 
@@ -140,11 +155,11 @@ def train_damage(
             "embedding_dim": EMBEDDING_DIM,
             "time_format": "YYYY-MM-DD HH:MM:SS+HH:MM",
             "task": "multiclass",
-            "class_labels": [0,1,2,3,4,5],
+            "class_labels": present_classes.tolist(),
             "created_utc": datetime.utcnow().isoformat() + "Z",
         }, f, indent=2)
 
-    return {"accuracy": acc, "macro_f1": macro_f1, "log_loss": ll}
+    return {"accuracy": acc, "macro_f1": macro_f1, "log_loss": ll, "class_weights": {int(c): float(class_weights[i]) for i,c in enumerate(classes)}}
 
 
 def _load_model(model_dir: str):
@@ -195,11 +210,11 @@ def main():
     import argparse
     import sys
 
-    # Auto-run training if no arguments: looks for train.csv/test.csv in CWD or ./data
+    # Auto-run training if no arguments: looks for train_i.csv/test_i.csv in CWD or ./data
     if len(sys.argv) == 1:
         candidates = [
-            (os.path.join(os.getcwd(), "train.csv"), os.path.join(os.getcwd(), "test.csv")),
-            (os.path.join(os.getcwd(), "data", "train.csv"), os.path.join(os.getcwd(), "data", "test.csv")),
+            (os.path.join(os.getcwd(), "train_i.csv"), os.path.join(os.getcwd(), "test_i.csv")),
+            (os.path.join(os.getcwd(), "data", "train_i.csv"), os.path.join(os.getcwd(), "data", "test_i.csv")),
         ]
         for tr, te in candidates:
             if os.path.exists(tr) and os.path.exists(te):
@@ -213,7 +228,7 @@ def main():
                 )
                 print(json.dumps(metrics, indent=2))
                 return
-        print("No arguments and train.csv/test.csv not found in CWD or ./data.")
+        print("No arguments and train_i.csv/test_i.csv not found in CWD or ./data.")
 
     parser = argparse.ArgumentParser(description="XGBoost tornado magnitude prediction (training only; inference via risk_inference)")
     sub = parser.add_subparsers(dest="cmd")
