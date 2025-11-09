@@ -3,7 +3,7 @@ from flask_cors import CORS
 import numpy as np
 from datetime import datetime
 import traceback
-
+from embedding_match import get_alphaearth_record as generate_embedding
 app = Flask(__name__)
 CORS(app)
 
@@ -128,17 +128,6 @@ def parse_damage_result(result):
 # RISK CALCULATION WITH ML
 # ==============================================================================
 
-def generate_embedding(latitude, longitude, time_str=None):
-    """
-    Generate a 64-d embedding for the ML model.
-    In production this could be derived from real meteorological or satellite data.
-    For now, we generate a semi-random vector seeded by the location for reproducibility.
-    """
-    # Seed using location for reproducible outputs
-    seed = int((abs(latitude) * 1000 + abs(longitude) * 1000) % 2**32)
-    np.random.seed(seed)
-    embedding = np.random.rand(64).astype(float).tolist()
-    return embedding
 
 
 def get_risk_level(risk_score):
