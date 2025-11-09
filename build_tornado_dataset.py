@@ -18,8 +18,7 @@ Behavior:
    segment (start->end) is within 3 km geodesic distance of the point.
  - Labels:
      label_occ: 1 if a matching event exists, else 0
-     label_int_ef: EF of nearest matching tornado (NaN if none)
-     label_int_wind_ms: median wind (m/s) per EF mapping (NaN if none)
+     label_ef: Enhanced Fujita scale (0..4) from events 'Magnitude'; NaN if none
  - Dataset is rebalanced to ~35% positives via over/under-sampling.
  - Final dataset is split into 80/20 train/test.
 
@@ -35,7 +34,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from typing import Dict, Optional, Tuple, List
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -91,23 +90,6 @@ def normalize_ef(value) -> Optional[int]:
         return None
 
 
-def ef_to_median_ms(ef: Optional[int]) -> Optional[float]:
-    """Map EF to median wind speed in m/s. Returns None if EF is None/out of range.
-    EF0 = 33.5, EF1 = 43.5, EF2 = 55, EF3 = 67.5, EF4 = 82, EF5 = 95
-    """
-    mapping: Dict[int, float] = {
-        0: 33.5,
-        1: 43.5,
-        2: 55.0,
-        3: 67.5,
-        4: 82.0,
-        5: 95.0,
-    }
-    if ef is None:
-        return None
-    return mapping.get(int(ef))
-
-
 def distance_point_to_segment_m(lat: float, lon: float, line_ll: LineString) -> float:
     """Compute geodesic-like distance (meters) from a lat/lon point to a small
     line segment expressed in lon/lat (EPSG:4326), using a local Azimuthal
@@ -142,7 +124,7 @@ def compute_labels_for_point(
     events: pd.DataFrame,
     time_window_hours: int = 3,
     dist_threshold_m: float = 3000.0,
-) -> Tuple[int, Optional[int], Optional[float]]:
+) -> Tuple[int, Optional[int]]:
     """Compute (label_occ, label_int_ef, label_int_wind_ms) for one point.
 
     - Filter events whose active window overlaps [t - H, t + H].
@@ -155,7 +137,7 @@ def compute_labels_for_point(
     end_w = t_utc + pd.Timedelta(hours=time_window_hours)
     cand = events[(events["end_time_utc"] >= start_w) & (events["begin_time_utc"] <= end_w)]
     if cand.empty:
-        return 0, None, None
+        return 0, None
 
     # Spatial bounding-box prefilter (~3 km ~ 0.027 deg latitude)
     delta_lat = 0.03  # conservative margin (~3.3 km)
@@ -169,7 +151,7 @@ def compute_labels_for_point(
         & (lon <= cand["max_lon"] + delta_lon)
     ]
     if cand.empty:
-        return 0, None, None
+        return 0, None
 
     # Precise distances to each candidate segment
     dists = []
@@ -183,17 +165,16 @@ def compute_labels_for_point(
         dists.append((idx, d_m))
 
     if not dists:
-        return 0, None, None
+        return 0, None
 
     # Find nearest candidate within threshold
     nearest_idx, nearest_d = min(dists, key=lambda x: x[1])
     if nearest_d <= dist_threshold_m:
         ef_raw = cand.loc[nearest_idx, "EF_norm"]
         ef_int = int(ef_raw) if ef_raw is not None else None
-        wind_ms = ef_to_median_ms(ef_int)
-        return 1, ef_int, wind_ms
+        return 1, ef_int
 
-    return 0, None, None
+    return 0, None
 
 
 def balance_dataset(df: pd.DataFrame, target_pos_ratio: float, random_state: int = 42) -> pd.DataFrame:
@@ -300,8 +281,8 @@ def main():
         col_begin = find_col(df_raw, ["begin_time_utc", "begin_time", "start_time", "date", "datetime", "time"])  # type: ignore
         col_end = find_col(df_raw, ["end_time_utc", "end_time", "stop_time", "finish_time"])  # type: ignore
 
-        # EF columns
-        col_ef = find_col(df_raw, ["ef", "ef_scale", "efscale", "magnitude"])
+        # EF columns: prefer Magnitude (values 0..4, -9=unknown)
+        col_ef = find_col(df_raw, ["magnitude", "ef", "ef_scale", "efscale"])  # prefer 'Magnitude'
 
         missing = [name for name, col in (
             ("start_lat", col_slat),
@@ -332,9 +313,9 @@ def main():
         df["begin_time_utc"] = begin_parsed
         df["end_time_utc"] = end_parsed
 
-        # EF normalization (optional)
+        # EF normalization (optional) from Magnitude-like column
         if col_ef is not None:
-            df["EF"] = df_raw[col_ef]
+            df["EF"] = pd.to_numeric(df_raw[col_ef], errors="coerce")
         else:
             df["EF"] = np.nan
 
@@ -374,6 +355,10 @@ def main():
         f_df.copy(), geometry=gpd.points_from_xy(f_df["lon"], f_df["lat"]), crs="EPSG:4326"
     )
 
+    # Filter out events with unknown EF if provided as -9 in Magnitude
+    if "EF" in e_df.columns:
+        e_df = e_df[~(e_df["EF"] == -9)].reset_index(drop=True)
+
     # Event geometry as line segment from (start_lon, start_lat) to (end_lon, end_lat)
     e_geom = [
         LineString([(lon1, lat1), (lon2, lat2)])
@@ -383,8 +368,12 @@ def main():
     ]
     e_gdf = gpd.GeoDataFrame(e_df.copy(), geometry=e_geom, crs="EPSG:4326")
 
-    # Normalize EF to integers 0..5 where possible
-    e_gdf["EF_norm"] = e_gdf["EF"].apply(normalize_ef)
+    # Normalize EF to integers using Magnitude (0..4) where possible
+    # If EF column exists and is numeric, use it; else fall back to parsed 'EF_norm'
+    if "EF" in e_gdf.columns:
+        e_gdf["EF_norm"] = pd.to_numeric(e_gdf["EF"], errors="coerce").astype("Int64")
+    else:
+        e_gdf["EF_norm"] = e_gdf["EF"].apply(normalize_ef)
 
     # Precompute simple bounding boxes to speed up spatial prefiltering
     e_gdf["min_lat"] = e_gdf[["start_lat", "end_lat"]].min(axis=1)
@@ -398,7 +387,6 @@ def main():
     dist_m = float(args.dist_km) * 1000.0
     labels_occ = []
     labels_ef = []
-    labels_wind = []
 
     # Iterate per point; for large datasets consider chunking or multiprocessing
     for i, row in f_gdf.iterrows():
@@ -406,7 +394,7 @@ def main():
         lon = float(row["lon"])
         t = pd.Timestamp(row["time_utc"]).tz_convert("UTC")
 
-        occ, ef, wind = compute_labels_for_point(
+        occ, ef = compute_labels_for_point(
             lat=lat,
             lon=lon,
             t_utc=t,
@@ -416,20 +404,22 @@ def main():
         )
         labels_occ.append(occ)
         labels_ef.append(ef if ef is not None else np.nan)
-        labels_wind.append(wind if wind is not None else np.nan)
 
         # Light progress indicator every 10k rows
         if (i + 1) % 10000 == 0:
             print(f"Labeled {i+1} rows...")
 
     f_gdf["label_occ"] = labels_occ
-    f_gdf["label_int_ef"] = labels_ef
-    f_gdf["label_int_wind_ms"] = labels_wind
+    f_gdf["label_ef"] = labels_ef
 
     # ---------------------------------------------
     # Balance dataset to target positive ratio
     # ---------------------------------------------
     labeled_df = pd.DataFrame(f_gdf.drop(columns=["geometry"]))
+    # Ensure only the requested labels exist (label_occ, label_ef)
+    for col in list(labeled_df.columns):
+        if col.startswith("label_") and col not in ("label_occ", "label_ef"):
+            labeled_df = labeled_df.drop(columns=[col])
     balanced_df = balance_dataset(labeled_df, target_pos_ratio=float(args.target_pos_ratio), random_state=int(args.random_state))
 
     # ---------------------------------------------
