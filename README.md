@@ -1,6 +1,6 @@
 # EarthInsurance
 
-Tornado risk prediction with XGBoost using satellite embeddings and contextual spatiotemporal features. Ships a Flask API and a React + Leaflet map UI.
+Tornado risk prediction with XGBoost using AlphaEarth embeddings, contextual spatiotemporal features and risk features(occurence and magnitude with FEMA dataset). Ships a Flask API and a React + Leaflet map UI.
 
 ## Quickstart
 
@@ -44,19 +44,19 @@ Other endpoints: `/api/health`, `/api/batch-calculate-risk`, `/api/risk-zones`, 
 
 - Probability (occurrence):
   ```
-  python Backend/tornado_probability.py train --train path/to/train.csv --test path/to/test.csv --outdir Backend/models_prob
+  py Backend/tornado_probability.py train --train Backend/data/train.csv --test Backend/data/test.csv --outdir Backend/models_prob
   ```
 - Magnitude (EF classifier):
   ```
-  python Backend/tornado_damage.py train --train path/to/train_i.csv --test path/to/test_i.csv --outdir Backend/models_damage
+  py Backend/tornado_damage.py train --train Backend/data/train_i.csv --test Backend/data/test_i.csv --outdir Backend/models_damage
   ```
 
-CSV schema: `lat, lon, time_utc, f1..f64` (+ `label_occ` for probability, `label_magn` for magnitude). Time format: `YYYY-MM-DD HH:MM:SS+HH:MM` or `...Z`.
+CSV schema: `lat, lon, time_utc, f1..f64` (+ `??` for probability, `??` for magnitude). Time format: `YYYY-MM-DD HH:MM:SS+HH:MM` or `YYYY-MM-DDTHH:MM:SSZ`.
 
 ## Repo Layout
 
 - `Backend/api.py` Flask API
-- `Backend/risk_inference.py` model loading + features
+- `Backend/risk_inference.py` model loading 
 - `Backend/models_prob/` and `Backend/models_damage/` pretrained models
 - `Frontend/` React app (Vite + Leaflet)
 
