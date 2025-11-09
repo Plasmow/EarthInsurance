@@ -1,20 +1,22 @@
-"""
-High-level inference helpers for EarthInsurance models.
+"""High-level inference helpers for EarthInsurance models.
+
+Now supports:
+    - Occurrence probability (binary classifier)
+    - Magnitude distribution (multiclass 0..5) OR legacy regression magnitude
 
 Usage example:
+    from risk_inference import predict_probability, predict_damage, predict_all
+    p = predict_probability(embedding, lat, lon, time_utc)  # float in [0,1]
+    d = predict_damage(embedding, lat, lon, time_utc)       # {"magnitude_probs": [...]} or legacy magnitude
+    all_res = predict_all(embedding, lat, lon, time_utc)    # merged dict
 
-from risk_inference import predict_probability, predict_damage, predict_all
-p = predict_probability(embedding, lat, lon, time_utc)
-d = predict_damage(embedding, lat, lon, time_utc)
-all_res = predict_all(embedding, lat, lon, time_utc)
+Inputs:
+    - embedding: list[float] length 64
+    - lat, lon: float
+    - time_utc: 'YYYY-MM-DD HH:MM:SS+HH:MM' (or trailing 'Z')
 
-- embedding: list[float] of length 64
-- lat, lon: float
-- time_utc: str in 'YYYY-MM-DD HH:MM:SS+HH:MM' (or with trailing 'Z')
-
-This module loads the trained weights from models_prob/ and models_damage/ by default,
-recomputes the exact feature set (embedding + geospatial + cyclical time features), and
-returns model outputs.
+If only a legacy regression magnitude model exists, we convert its output to a one-hot
+probability vector.
 """
 from __future__ import annotations
 import os
@@ -79,9 +81,8 @@ def _build_row(embedding: List[float], lat: float, lon: float, time_utc: Union[s
     return pd.DataFrame([row])
 
 
-# Cached loaders
-_prob_cache = None  # (clf, feature_names)
-_dmg_cache = None   # (reg_f, reg_w, feature_names)
+_prob_cache = None    # (clf, feature_names)
+_magn_cache = None    # (model, feature_names, class_labels, model_type)
 
 
 def _resolve_dir(model_dir: str) -> str:
@@ -106,18 +107,29 @@ def _load_prob(model_dir: str = "models_prob"):
     return _prob_cache
 
 
-def _load_dmg(model_dir: str = "models_damage"):
-    global _dmg_cache
-    if _dmg_cache is not None:
-        return _dmg_cache
+def _load_magnitude(model_dir: str = "models_damage"):
+    global _magn_cache
+    if _magn_cache is not None:
+        return _magn_cache
     base = _resolve_dir(model_dir)
-    m_path = os.path.join(base, "tornado_magnitude_xgb.json")
     meta_path = os.path.join(base, "preprocess.json")
-    reg_m = XGBRegressor(); reg_m.load_model(m_path)
+    cls_path = os.path.join(base, "tornado_magnitude_cls_xgb.json")
+    reg_path = os.path.join(base, "tornado_magnitude_xgb.json")  # legacy regression
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError("Missing preprocess.json for magnitude model")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
-    _dmg_cache = (reg_m, meta["feature_names"])
-    return _dmg_cache
+    feature_names = meta.get("feature_names")
+    class_labels = meta.get("class_labels", [0,1,2,3,4,5])
+    if os.path.exists(cls_path):
+        model = XGBClassifier(); model.load_model(cls_path)
+        _magn_cache = (model, feature_names, class_labels, "cls")
+    elif os.path.exists(reg_path):
+        model = XGBRegressor(); model.load_model(reg_path)
+        _magn_cache = (model, feature_names, class_labels, "reg")
+    else:
+        raise FileNotFoundError("No magnitude model found (expected classifier or legacy regressor)")
+    return _magn_cache
 
 
 def predict_probability(
@@ -154,9 +166,6 @@ def predict_probability(
 
 
 
-essential_damage_keys = ("tornado_magnitude")
-
-
 def predict_damage(
     embedding: List[float],
     lat: float,
@@ -164,11 +173,24 @@ def predict_damage(
     time_utc: Union[str, datetime],
     model_damage_dir: str = "models_damage",
 ) -> Dict[str, float]:
-    reg_m, feature_names = _load_dmg(model_damage_dir)
+    model, feature_names, class_labels, model_type = _load_magnitude(model_damage_dir)
     X = _build_row(embedding, lat, lon, time_utc).reindex(columns=feature_names, fill_value=0.0)
-    return {
-        "tornado_magnitude": float(reg_m.predict(X)[0]),
-    }
+    if model_type == "cls":
+        try:
+            booster = model.get_booster(); proba = booster.predict(xgb.DMatrix(X))
+            probs = np.asarray(proba)[0]
+        except Exception:
+            probs = np.asarray(model.predict_proba(X))[0]
+        probs = probs / probs.sum() if probs.sum() > 0 else probs
+        return {"magnitude_probs": [float(p) for p in probs.tolist()]}
+    # legacy regression fallback
+    try:
+        booster = model.get_booster(); mag_val = float(np.asarray(booster.predict(xgb.DMatrix(X))).ravel()[0])
+    except Exception:
+        mag_val = float(np.asarray(model.predict(X)).ravel()[0])
+    mag_cls = int(np.clip(round(mag_val), 0, len(class_labels)-1))
+    one_hot = [0.0]*len(class_labels); one_hot[mag_cls] = 1.0
+    return {"magnitude_probs": one_hot, "magnitude": float(mag_cls)}
 
 
 def predict_all(
@@ -180,37 +202,54 @@ def predict_all(
     model_damage_dir: str = "models_damage",
 ) -> Dict[str, float]:
     p = predict_probability(embedding, lat, lon, time_utc, model_prob_dir)
-    out = {"probability": p}
+    out: Dict[str, float] = {"probability": p}
     try:
         d = predict_damage(embedding, lat, lon, time_utc, model_damage_dir)
         out.update(d)
+        if "magnitude_probs" in d:
+            probs = np.asarray(d["magnitude_probs"]).ravel()
+            if probs.size > 0:
+                out["magnitude"] = int(np.argmax(probs))
     except Exception:
-        # Damage models optional; if not present, return probability only
         pass
     return out
 
 
 
-embedding = np.random.rand(64).astype(float).tolist()
+# No module-level test execution; import-only module.
+# example:
 
+def test_few_examples():
+    for i in range(100):
+        embedding = np.random.rand(64).tolist()
+        lat = np.random.uniform(-90.0, 90.0)
+        lon = np.random.uniform(-180.0, 180.0)
+        time_utc = "2025-05-02 14:30:00+00:00"
+        prob = predict_probability(embedding, lat, lon, time_utc)
+        damage = predict_damage(embedding, lat, lon, time_utc)
+        all_res = predict_all(embedding, lat, lon, time_utc)
+        assert 0.0 <= prob <= 1.0
+        assert "magnitude_probs" in damage
+        assert "magnitude" in all_res or "magnitude_probs" in all_res
+        magnitude= all_res.get("magnitude")
+        if magnitude!=0:
+            print(f"Example {i+1}: prob={prob:.4f}, damage={damage}, all={all_res}")
+        
+test_few_examples()
+        
+    
+data_example= {
+    "embedding": [0.1]*64, 
+    "lat": 40.43685,
+    "lon": -90.195,
+    "time_utc": "2025-05-02 14:30:00+00:00",
+}
 
-d = predict_probability(
-embedding=embedding,
-lat=35.47,
-lon=-97.52,
-time_utc="2025-05-02 14:30:00+00:00",
-model_prob_dir="models_prob",
+result = predict_all(    
+    embedding=data_example["embedding"],
+    lat=data_example["lat"],
+    lon=data_example["lon"],
+    time_utc=data_example["time_utc"],
 )
 
-m=predict_damage(
-embedding=embedding,
-lat=35.47,
-lon=-97.52,
-time_utc="2025-05-02 14:30:00+00:00",
-model_damage_dir="models_damage",
-)
-
-print(d) # float probability value
-
-
-print(m) # {"tornado_magnitude": float}
+print(result)

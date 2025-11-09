@@ -5,10 +5,10 @@ from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_squared_error
-from xgboost import XGBRegressor
+from sklearn.metrics import accuracy_score, f1_score, log_loss
+from xgboost import XGBClassifier
 
-# Schema: lat, lon, time_utc, f1..f64, label_magn
+# Expected schema: lat, lon, time_utc, f1..f64, label_magn
 
 
 
@@ -47,6 +47,7 @@ def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, floa
 
 
 def _validate_columns(df: pd.DataFrame) -> None:
+    # Ensure the minimal required columns are present for magnitude classification
     required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_magn"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -82,6 +83,9 @@ def _load_train_test(train_csv: str, test_csv: str):
     X_test, _ = _build_X(test_df)
     y_train = pd.to_numeric(train_df["label_magn"], errors="coerce").fillna(0.0)
     y_test = pd.to_numeric(test_df["label_magn"], errors="coerce").fillna(0.0)
+    # Enforce non-negativity in training labels before transform
+    y_train = y_train.clip(lower=0.0)
+    y_test = y_test.clip(lower=0.0)
     return X_train, y_train, X_test, y_test, feature_names
 
 
@@ -99,7 +103,26 @@ def train_damage(
     os.makedirs(outdir, exist_ok=True)
     (X_tr, y_tr, X_te, y_te, feature_names) = _load_train_test(train_csv, test_csv)
 
-    reg = XGBRegressor(
+    # Prepare multiclass labels; infer classes present in training set
+    y_tr = pd.to_numeric(y_tr, errors="coerce").fillna(0.0).astype(int).clip(lower=0)
+    y_te = pd.to_numeric(y_te, errors="coerce").fillna(0.0).astype(int).clip(lower=0)
+    present_classes = np.unique(y_tr.values)
+    present_classes = np.sort(present_classes)
+    num_class = int(len(present_classes))
+    if num_class < 2:
+        raise ValueError("Need at least 2 classes present in training labels for multiclass.")
+
+    # Compute class frequencies for weighting (inverse frequency, normalized)
+    classes = present_classes
+    freq = np.array([(y_tr == c).sum() for c in classes], dtype=float)
+    # Avoid division by zero; if class absent set minimal frequency
+    freq = np.where(freq==0, 1e-6, freq)
+    inv = 1.0 / freq
+    class_weights = inv / inv.sum() * len(classes)  # scaled so average weight ~1
+    cw_map = {c: class_weights[i] for i,c in enumerate(classes)}
+    sample_weight = np.array([cw_map[v] for v in y_tr], dtype=float)
+
+    clf = XGBClassifier(
         n_estimators=5000,
         max_depth=9,
         learning_rate=0.03,
@@ -107,35 +130,53 @@ def train_damage(
         colsample_bytree=0.85,
         min_child_weight=2.0,
         reg_lambda=1.5,
-        objective="reg:squarederror",
-        eval_metric="rmse",
+        objective="multi:softprob",
+        num_class=num_class,
+        eval_metric="mlogloss",
         tree_method=_tree_method(use_gpu),
         random_state=random_state,
         n_jobs=0,
     )
-    # Train without early stopping for broader xgboost version compatibility
-    reg.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
+    # Train without early stopping for broader XGBoost version compatibility
+    clf.fit(X_tr, y_tr, sample_weight=sample_weight, eval_set=[(X_te, y_te)], verbose=False)
 
-    rmse = float(np.sqrt(mean_squared_error(y_te, reg.predict(X_te))))
+    proba = clf.predict_proba(X_te)
+    y_pred = np.asarray(proba).argmax(axis=1)
+    acc = float(accuracy_score(y_te, y_pred))
+    macro_f1 = float(f1_score(y_te, y_pred, average="macro"))
+    try:
+        ll = float(log_loss(y_te, proba, labels=present_classes.tolist()))
+    except Exception:
+        ll = float(log_loss(y_te, proba))
 
-    reg.save_model(os.path.join(outdir, "tornado_magnitude_xgb.json"))
+    clf.save_model(os.path.join(outdir, "tornado_magnitude_cls_xgb.json"))
     with open(os.path.join(outdir, "preprocess.json"), "w", encoding="utf-8") as f:
         json.dump({
             "feature_names": feature_names,
             "embedding_dim": EMBEDDING_DIM,
             "time_format": "YYYY-MM-DD HH:MM:SS+HH:MM",
+            "task": "multiclass",
+            "class_labels": present_classes.tolist(),
             "created_utc": datetime.utcnow().isoformat() + "Z",
         }, f, indent=2)
 
-    return {"rmse_magnitude": rmse}
+    return {"accuracy": acc, "macro_f1": macro_f1, "log_loss": ll, "class_weights": {int(c): float(class_weights[i]) for i,c in enumerate(classes)}}
 
 
 def _load_model(model_dir: str):
-    reg = XGBRegressor()
-    reg.load_model(os.path.join(model_dir, "tornado_magnitude_xgb.json"))
+    clf = XGBClassifier()
+    # New filename for classifier; keep fallback to old if needed
+    model_candidates = [
+        os.path.join(model_dir, "tornado_magnitude_cls_xgb.json"),
+        os.path.join(model_dir, "tornado_magnitude_xgb.json"),
+    ]
+    for mp in model_candidates:
+        if os.path.exists(mp):
+            clf.load_model(mp)
+            break
     with open(os.path.join(model_dir, "preprocess.json"), "r", encoding="utf-8") as f:
         meta = json.load(f)
-    return reg, meta["feature_names"]
+    return clf, meta["feature_names"]
 
 
 def _build_single_row(embedding: List[float], lat: float, lon: float, time_utc: Union[str, datetime]) -> pd.DataFrame:
@@ -158,24 +199,23 @@ def _build_single_row(embedding: List[float], lat: float, lon: float, time_utc: 
 
 
 def predict_damage(model_dir: str, embedding: List[float], lat: float, lon: float, time_utc: Union[str, datetime]) -> Dict[str, float]:
-    # Backward-compatible function name; now returns magnitude only
-    reg, feature_names = _load_model(model_dir)
+    # Backward-compatible function name; now returns probability vector over magnitudes 0..5
+    clf, feature_names = _load_model(model_dir)
     X = _build_single_row(embedding=embedding, lat=lat, lon=lon, time_utc=time_utc)
     X = X.reindex(columns=feature_names, fill_value=0.0)
-    return {
-        "magnitude": float(reg.predict(X)[0]),
-    }
+    proba = clf.predict_proba(X)[0]
+    return {"magnitude_probs": [float(p) for p in proba.tolist()]}
 
 
 def main():
     import argparse
     import sys
 
-    # Auto-run training if no arguments: looks for train.csv/test.csv in CWD or ./data
+    # Auto-run training if no arguments: looks for train_i.csv/test_i.csv in CWD or ./data
     if len(sys.argv) == 1:
         candidates = [
-            (os.path.join(os.getcwd(), "train.csv"), os.path.join(os.getcwd(), "test.csv")),
-            (os.path.join(os.getcwd(), "data", "train.csv"), os.path.join(os.getcwd(), "data", "test.csv")),
+            (os.path.join(os.getcwd(), "train_i.csv"), os.path.join(os.getcwd(), "test_i.csv")),
+            (os.path.join(os.getcwd(), "data", "train_i.csv"), os.path.join(os.getcwd(), "data", "test_i.csv")),
         ]
         for tr, te in candidates:
             if os.path.exists(tr) and os.path.exists(te):
@@ -189,9 +229,9 @@ def main():
                 )
                 print(json.dumps(metrics, indent=2))
                 return
-        print("No arguments and train.csv/test.csv not found in CWD or ./data.")
+        print("No arguments and train_i.csv/test_i.csv not found in CWD or ./data.")
 
-    parser = argparse.ArgumentParser(description="XGBoost tornado magnitude prediction")
+    parser = argparse.ArgumentParser(description="XGBoost tornado magnitude prediction (training only; inference via risk_inference)")
     sub = parser.add_subparsers(dest="cmd")
 
     p_train = sub.add_parser("train", help="Train regressors with train/test CSVs")
@@ -201,12 +241,7 @@ def main():
     p_train.add_argument("--gpu", action="store_true")
     p_train.add_argument("--seed", type=int, default=42)
 
-    p_pred = sub.add_parser("predict", help="Predict magnitude for one example")
-    p_pred.add_argument("--modeldir", default="models_damage")
-    p_pred.add_argument("--embedding", required=True, help="Comma-separated 64 floats or @path")
-    p_pred.add_argument("--lat", type=float, required=True)
-    p_pred.add_argument("--lon", type=float, required=True)
-    p_pred.add_argument("--time", required=True, help='"YYYY-MM-DD HH:MM:SS+HH:MM"')
+    # No predict CLI; use risk_inference.py for inference
 
     args = parser.parse_args()
     if args.cmd == "train":
@@ -219,25 +254,7 @@ def main():
         )
         print(json.dumps(metrics, indent=2))
     else:
-        emb_arg = args.embedding
-        if emb_arg.startswith("@") and os.path.exists(emb_arg[1:]):
-            path = emb_arg[1:]
-            if path.endswith(".npy"):
-                embedding = np.load(path).astype(float).tolist()
-            else:
-                with open(path, "r", encoding="utf-8") as f:
-                    txt = f.read().replace("\n", " ").replace("\t", " ")
-                embedding = [float(x) for x in txt.replace(",", " ").split() if x]
-        else:
-            embedding = [float(x) for x in emb_arg.split(",")]
-        res = predict_damage(
-            model_dir=args.modeldir,
-            embedding=embedding,
-            lat=args.lat,
-            lon=args.lon,
-            time_utc=args.time,
-        )
-        print(json.dumps(res))
+        parser.print_help()
 
 
 if __name__ == "__main__":
