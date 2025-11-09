@@ -1,0 +1,241 @@
+import json
+import os
+from datetime import datetime
+from typing import Dict, List, Tuple, Union
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score
+from xgboost import XGBClassifier
+
+# Schema attendu: lat, lon, time_utc, f1..f64, label_occ, label_int_f, label_int_wind_ms
+
+EMBEDDING_DIM = 64
+EMBED_COLS = [f"f{i}" for i in range(1, EMBEDDING_DIM + 1)]
+
+
+def _parse_time_strict(s: Union[str, datetime]) -> datetime:
+	if isinstance(s, datetime):
+		return s
+	return datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S")
+
+
+def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, float]:
+	# Month
+	m_angle = 2.0 * np.pi * (ts.month - 1) / 12.0
+	m_sin, m_cos = float(np.sin(m_angle)), float(np.cos(m_angle))
+	# Day of year
+	doy = ts.timetuple().tm_yday
+	d_angle = 2.0 * np.pi * (doy - 1) / 365.25
+	d_sin, d_cos = float(np.sin(d_angle)), float(np.cos(d_angle))
+	# Hour of day
+	h_angle = 2.0 * np.pi * ts.hour / 24.0
+	h_sin, h_cos = float(np.sin(h_angle)), float(np.cos(h_angle))
+	return m_sin, m_cos, d_sin, d_cos, h_sin, h_cos
+
+
+def _validate_columns(df: pd.DataFrame) -> None:
+	required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_occ", "label_int_f", "label_int_wind_ms"]
+	missing = [c for c in required if c not in df.columns]
+	if missing:
+		raise ValueError(f"Colonnes manquantes: {missing}")
+
+
+def _build_X(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+	_validate_columns(df)
+	# Time features
+	t_parsed = df["time_utc"].apply(_parse_time_strict)
+	feats = list(zip(*t_parsed.apply(_cyc_features)))
+	month_sin, month_cos, doy_sin, doy_cos, hour_sin, hour_cos = feats
+	geo_df = pd.DataFrame({
+		"lat": pd.to_numeric(df["lat"], errors="coerce").fillna(0.0),
+		"lon": pd.to_numeric(df["lon"], errors="coerce").fillna(0.0),
+		"month_sin": month_sin,
+		"month_cos": month_cos,
+		"doy_sin": doy_sin,
+		"doy_cos": doy_cos,
+		"hour_sin": hour_sin,
+		"hour_cos": hour_cos,
+	})
+	emb_df = df[EMBED_COLS].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+	X = pd.concat([emb_df.reset_index(drop=True), geo_df.reset_index(drop=True)], axis=1)
+	return X, list(X.columns)
+
+
+def _load_train_test(train_csv: str, test_csv: str):
+	train_df = pd.read_csv(train_csv)
+	test_df = pd.read_csv(test_csv)
+	_validate_columns(train_df)
+	_validate_columns(test_df)
+	X_train, feature_names = _build_X(train_df)
+	X_test, _ = _build_X(test_df)
+	y_train = train_df["label_occ"].astype(int)
+	y_test = test_df["label_occ"].astype(int)
+	return X_train, y_train, X_test, y_test, feature_names
+
+
+def _scale_pos_weight(y) -> float:
+	pos = float((y == 1).sum())
+	neg = float((y == 0).sum())
+	if pos == 0:
+		return 1.0
+	return max(1.0, neg / pos)
+
+
+def _tree_method(use_gpu: bool) -> str:
+	return "gpu_hist" if use_gpu else "hist"
+
+
+def train_probability(
+	train_csv: str,
+	test_csv: str,
+	outdir: str = "models_prob",
+	use_gpu: bool = False,
+	random_state: int = 42,
+) -> Dict[str, float]:
+	os.makedirs(outdir, exist_ok=True)
+	X_tr, y_tr, X_te, y_te, feature_names = _load_train_test(train_csv, test_csv)
+
+	clf = XGBClassifier(
+		n_estimators=5000,
+		max_depth=9,
+		learning_rate=0.03,
+		subsample=0.8,
+		colsample_bytree=0.85,
+		min_child_weight=2.0,
+		reg_lambda=1.5,
+		gamma=0.0,
+		objective="binary:logistic",
+		eval_metric="auc",
+		tree_method=_tree_method(use_gpu),
+		scale_pos_weight=_scale_pos_weight(y_tr),
+		random_state=random_state,
+		n_jobs=0,
+	)
+	clf.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False, early_stopping_rounds=300)
+
+	prob = clf.predict_proba(X_te)[:, 1]
+	auc = float(roc_auc_score(y_te, prob))
+	ap = float(average_precision_score(y_te, prob))
+	acc = float(accuracy_score(y_te, (prob >= 0.5).astype(int)))
+
+	# Save
+	clf.save_model(os.path.join(outdir, "tornado_prob_xgb.json"))
+	with open(os.path.join(outdir, "preprocess.json"), "w", encoding="utf-8") as f:
+		json.dump({
+			"feature_names": feature_names,
+			"embedding_dim": EMBEDDING_DIM,
+			"time_format": "YYYY-MM-DD HH:MM:SS",
+			"created_utc": datetime.utcnow().isoformat() + "Z",
+		}, f, indent=2)
+
+	return {"auc": auc, "average_precision": ap, "accuracy": acc}
+
+
+def _load_model(model_dir: str):
+	clf = XGBClassifier()
+	clf.load_model(os.path.join(model_dir, "tornado_prob_xgb.json"))
+	with open(os.path.join(model_dir, "preprocess.json"), "r", encoding="utf-8") as f:
+		meta = json.load(f)
+	return clf, meta["feature_names"]
+
+
+def _build_single_row(embedding: List[float], lat: float, lon: float, time_utc: Union[str, datetime]) -> pd.DataFrame:
+	if len(embedding) != EMBEDDING_DIM:
+		raise ValueError(f"Embedding length must be {EMBEDDING_DIM}")
+	ts = _parse_time_strict(time_utc)
+	m_sin, m_cos, d_sin, d_cos, h_sin, h_cos = _cyc_features(ts)
+	row: Dict[str, float] = {f"f{i+1}": float(embedding[i]) for i in range(EMBEDDING_DIM)}
+	row.update({
+		"lat": float(lat),
+		"lon": float(lon),
+		"month_sin": m_sin,
+		"month_cos": m_cos,
+		"doy_sin": d_sin,
+		"doy_cos": d_cos,
+		"hour_sin": h_sin,
+		"hour_cos": h_cos,
+	})
+	return pd.DataFrame([row])
+
+
+def predict_probability(model_dir: str, embedding: List[float], lat: float, lon: float, time_utc: Union[str, datetime]) -> float:
+	clf, feature_names = _load_model(model_dir)
+	X = _build_single_row(embedding=embedding, lat=lat, lon=lon, time_utc=time_utc)
+	X = X.reindex(columns=feature_names, fill_value=0.0)
+	return float(clf.predict_proba(X)[:, 1][0])
+
+
+def main():
+	import argparse
+	import sys
+
+	# Auto-run training if no arguments: expects train.csv and test.csv in data folder
+	if len(sys.argv) == 1:
+		default_train = os.path.join(os.getcwd(), "data", "train.csv")
+		default_test = os.path.join(os.getcwd(), "data", "test.csv")
+		if os.path.exists(default_train) and os.path.exists(default_test):
+			print(f"[auto] Training with {default_train} and {default_test} ...")
+			metrics = train_probability(
+				train_csv=default_train,
+				test_csv=default_test,
+				outdir="models_prob",
+				use_gpu=False,
+				random_state=42,
+			)
+			print(json.dumps(metrics, indent=2))
+			return
+		else:
+			print("No arguments and train.csv/test.csv not found in current directory.")
+
+	parser = argparse.ArgumentParser(description="XGBoost probability of tornado occurrence")
+	sub = parser.add_subparsers(dest="cmd")
+
+	p_train = sub.add_parser("train", help="Train classifier with train/test CSVs")
+	p_train.add_argument("--train", required=True)
+	p_train.add_argument("--test", required=True)
+	p_train.add_argument("--outdir", default="models_prob")
+	p_train.add_argument("--gpu", action="store_true")
+	p_train.add_argument("--seed", type=int, default=42)
+
+	p_pred = sub.add_parser("predict", help="Predict probability for one example")
+	p_pred.add_argument("--modeldir", default="models_prob")
+	p_pred.add_argument("--embedding", required=True, help="Comma-separated 64 floats or @path")
+	p_pred.add_argument("--lat", type=float, required=True)
+	p_pred.add_argument("--lon", type=float, required=True)
+	p_pred.add_argument("--time", required=True, help='"YYYY-MM-DD HH:MM:SS"')
+
+	args = parser.parse_args()
+	if args.cmd == "train":
+		metrics = train_probability(
+			train_csv=args.train,
+			test_csv=args.test,
+			outdir=args.outdir,
+			use_gpu=bool(args.gpu),
+			random_state=args.seed,
+		)
+		print(json.dumps(metrics, indent=2))
+	else:
+		emb_arg = args.embedding
+		if emb_arg.startswith("@") and os.path.exists(emb_arg[1:]):
+			path = emb_arg[1:]
+			if path.endswith(".npy"):
+				embedding = np.load(path).astype(float).tolist()
+			else:
+				with open(path, "r", encoding="utf-8") as f:
+					txt = f.read().replace("\n", " ").replace("\t", " ")
+				embedding = [float(x) for x in txt.replace(",", " ").split() if x]
+		else:
+			embedding = [float(x) for x in emb_arg.split(",")]
+		p = predict_probability(
+			model_dir=args.modeldir,
+			embedding=embedding,
+			lat=args.lat,
+			lon=args.lon,
+			time_utc=args.time,
+		)
+		print(json.dumps({"probability": p}))
+
+
+if __name__ == "__main__":
+	main()
