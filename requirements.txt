@@ -1,1 +1,7 @@
 earthengine-api
+pandas
+geopandas
+shapely
+numpy
+scikit-learn
+pyproj
