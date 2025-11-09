@@ -1,2 +1,12 @@
+
 earthengine-api
+<<<<<<< HEAD
 pandas
+=======
+pandas
+geopandas
+shapely
+numpy
+scikit-learn
+pyproj
+>>>>>>> origin/Adam
