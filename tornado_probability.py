@@ -208,7 +208,7 @@ def main():
                 return
         print("No arguments and train.csv/test.csv not found in CWD or ./data.")
 
-    parser = argparse.ArgumentParser(description="XGBoost probability of tornado occurrence")
+    parser = argparse.ArgumentParser(description="XGBoost probability of tornado occurrence (training only; inference via risk_inference)")
     sub = parser.add_subparsers(dest="cmd")
 
     p_train = sub.add_parser("train", help="Train classifier with train/test CSVs")
@@ -218,12 +218,7 @@ def main():
     p_train.add_argument("--gpu", action="store_true")
     p_train.add_argument("--seed", type=int, default=42)
 
-    p_pred = sub.add_parser("predict", help="Predict probability for one example")
-    p_pred.add_argument("--modeldir", default="models_prob")
-    p_pred.add_argument("--embedding", required=True, help="Comma-separated 64 floats or @path")
-    p_pred.add_argument("--lat", type=float, required=True)
-    p_pred.add_argument("--lon", type=float, required=True)
-    p_pred.add_argument("--time", required=True, help='"YYYY-MM-DD HH:MM:SS+HH:MM"')
+    # No predict CLI; use risk_inference.py for inference
 
     args = parser.parse_args()
     if args.cmd == "train":
@@ -236,25 +231,7 @@ def main():
         )
         print(json.dumps(metrics, indent=2))
     else:
-        emb_arg = args.embedding
-        if emb_arg.startswith("@") and os.path.exists(emb_arg[1:]):
-            path = emb_arg[1:]
-            if path.endswith(".npy"):
-                embedding = np.load(path).astype(float).tolist()
-            else:
-                with open(path, "r", encoding="utf-8") as f:
-                    txt = f.read().replace("\n", " ").replace("\t", " ")
-                embedding = [float(x) for x in txt.replace(",", " ").split() if x]
-        else:
-            embedding = [float(x) for x in emb_arg.split(",")]
-        p = predict_probability(
-            model_dir=args.modeldir,
-            embedding=embedding,
-            lat=args.lat,
-            lon=args.lon,
-            time_utc=args.time,
-        )
-        print(json.dumps({"probability": p}))
+        parser.print_help()
 
 
 if __name__ == "__main__":
