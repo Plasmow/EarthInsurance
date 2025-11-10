@@ -72,6 +72,4 @@ def get_alphaearth_record(lat: float,
 
 
 
-#--- Exemple d'usage ---
-rec = get_alphaearth_record(lat=40.43685,lon=-90.195,when="2023-05-02")
-print(rec)
+

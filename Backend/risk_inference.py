@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime, timezone
+from random import sample
 from typing import Dict, List, Tuple, Union
 from pathlib import Path
 
@@ -29,6 +30,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier, XGBRegressor
 import xgboost as xgb
+from embedding_match import get_alphaearth_record
 
 EMBEDDING_DIM = 64
 STRICT_FORMAT = "%Y-%m-%d %H:%M:%S%z"  # kept for backward compat (space variant)
@@ -228,11 +230,12 @@ def predict_damage(
     model, feature_names, class_labels, model_type = _load_magnitude(model_damage_dir)
     X = _build_row(embedding, lat, lon, time_utc).reindex(columns=feature_names, fill_value=0.0)
     if model_type == "cls":
+        # Prefer sklearn wrapper predict_proba to avoid potential DMatrix feature alignment quirks
         try:
+            probs = np.asarray(model.predict_proba(X))[0]
+        except Exception:
             booster = model.get_booster(); proba = booster.predict(xgb.DMatrix(X))
             probs = np.asarray(proba)[0]
-        except Exception:
-            probs = np.asarray(model.predict_proba(X))[0]
         probs = probs / probs.sum() if probs.sum() > 0 else probs
         return {"magnitude_probs": [float(p) for p in probs.tolist()]}
     # legacy regression fallback -> smooth probabilistic distribution around predicted magnitude
@@ -272,12 +275,21 @@ def predict_all(
 
 
 
-# No module-level test execution; import-only module.
-# example:
 
-# Removed automatic execution of random test examples and sample prediction;
-# keep a lightweight manual test helper callable by user code if desired.
+
 def manual_example():  # pragma: no cover (optional helper)
-    embedding = [0.1] * 64
-    res = predict_all(embedding, 40.43685, -90.195, "2025-05-02T14:30:00Z")
-    print(res)
+    embedding=get_alphaearth_record(
+        lat=37.43685,
+        lon=-91.9,
+        when="2023-05-02"
+    )["embedding"]
+
+    res = predict_all(embedding, 37.43685, -91.9, "2023-05-02 00:00:00+00:00")
+    print({
+        "source": "manual_example",
+        "input": {"lat": 37.43685, "lon": -91.9, "time_utc": "2023-05-02"},
+        "result": res
+    })
+
+if __name__ == "__main__":  # only run when executed directly, not on import
+    manual_example()

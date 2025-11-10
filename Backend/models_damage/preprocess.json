@@ -75,5 +75,13 @@
   ],
   "embedding_dim": 64,
   "time_format": "YYYY-MM-DD HH:MM:SS+HH:MM",
-  "created_utc": "2025-11-09T11:34:30.583287Z"
+  "task": "multiclass",
+  "class_labels": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "created_utc": "2025-11-10T00:59:41.984185Z"
 }

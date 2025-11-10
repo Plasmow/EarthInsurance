@@ -144,8 +144,9 @@ def train_probability(
         tree_method=_tree_method(use_gpu),
         scale_pos_weight=_scale_pos_weight(y_tr),
         random_state=random_state,
-        n_jobs=0,
+        n_jobs=-1,
     )
+    # Train; could add early stopping if desired (commented for broad version compatibility)
     clf.fit(X_tr, y_tr, eval_set=[(X_te, y_te)], verbose=False)
 
     prob = clf.predict_proba(X_te)[:, 1]
@@ -162,7 +163,7 @@ def train_probability(
             "created_utc": datetime.utcnow().isoformat() + "Z",
         }, f, indent=2)
 
-    return {"auc": auc, "average_precision": ap, "accuracy": acc}
+    return {"auc": auc, "average_precision": ap, "accuracy": acc, "scale_pos_weight": float(clf.get_xgb_params().get("scale_pos_weight", 1.0))}
 
 
 def _load_model(model_dir: str):
@@ -170,6 +171,17 @@ def _load_model(model_dir: str):
     clf.load_model(os.path.join(model_dir, "tornado_prob_xgb.json"))
     with open(os.path.join(model_dir, "preprocess.json"), "r", encoding="utf-8") as f:
         meta = json.load(f)
+    # Some xgboost versions don't restore sklearn wrapper attrs after load_model
+    # Ensure predict_proba() can work without errors
+    try:
+        _ = getattr(clf, "n_classes_")
+    except Exception:
+        clf.n_classes_ = 2
+    try:
+        _ = getattr(clf, "classes_")
+    except Exception:
+        import numpy as _np
+        clf.classes_ = _np.array([0, 1], dtype=_np.int64)
     return clf, meta["feature_names"]
 
 
@@ -205,8 +217,8 @@ def main():
 
     if len(sys.argv) == 1:
         candidates = [
-            (os.path.join(os.getcwd(), "train.csv"), os.path.join(os.getcwd(), "test.csv")),
-            (os.path.join(os.getcwd(), "data", "train.csv"), os.path.join(os.getcwd(), "data", "test.csv")),
+            (os.path.join(os.getcwd(), "train_occ.csv"), os.path.join(os.getcwd(), "test_occ.csv")),
+            (os.path.join(os.getcwd(), "data", "train_occ.csv"), os.path.join(os.getcwd(), "data", "test_occ.csv")),
         ]
         for tr, te in candidates:
             if os.path.exists(tr) and os.path.exists(te):
@@ -220,7 +232,7 @@ def main():
                 )
                 print(json.dumps(metrics, indent=2))
                 return
-        print("No arguments and train.csv/test.csv not found in CWD or ./data.")
+        print("No arguments and train_occ.csv/test_occ.csv not found in CWD or ./data.")
 
     parser = argparse.ArgumentParser(description="XGBoost probability of tornado occurrence (training only; inference via risk_inference)")
     sub = parser.add_subparsers(dest="cmd")

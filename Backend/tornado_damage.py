@@ -8,7 +8,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, log_loss
 from xgboost import XGBClassifier
 
-# Expected schema: lat, lon, time_utc, f1..f64, label_magn
+# Expected schema: lat, lon, time_utc, f1..f64, magnitude
 
 
 
@@ -64,7 +64,7 @@ def _cyc_features(ts: datetime) -> Tuple[float, float, float, float, float, floa
 
 def _validate_columns(df: pd.DataFrame) -> None:
     # Ensure the minimal required columns are present for magnitude classification
-    required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["label_magn"]
+    required = ["lat", "lon", "time_utc"] + EMBED_COLS + ["magnitude"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Colonnes manquantes: {missing}")
@@ -97,11 +97,11 @@ def _load_train_test(train_csv: str, test_csv: str):
     _validate_columns(test_df)
     X_train, feature_names = _build_X(train_df)
     X_test, _ = _build_X(test_df)
-    y_train = pd.to_numeric(train_df["label_magn"], errors="coerce").fillna(0.0)
-    y_test = pd.to_numeric(test_df["label_magn"], errors="coerce").fillna(0.0)
+    y_train = pd.to_numeric(train_df["magnitude"], errors="coerce")
+    y_test = pd.to_numeric(test_df["magnitude"], errors="coerce")
     # Enforce non-negativity in training labels before transform
-    y_train = y_train.clip(lower=0.0)
-    y_test = y_test.clip(lower=0.0)
+#    y_train = y_train.clip(lower=0.0)
+#    y_test = y_test.clip(lower=0.0)
     return X_train, y_train, X_test, y_test, feature_names
 
 
@@ -128,15 +128,15 @@ def train_damage(
     if num_class < 2:
         raise ValueError("Need at least 2 classes present in training labels for multiclass.")
 
-    # Compute class frequencies for weighting (inverse frequency, normalized)
-    classes = np.array([0,1,2,3,4,5])
+    # Compute class frequencies for weighting using only PRESENT classes
+    # Avoid including absent classes, which can distort normalization and collapse training.
+    classes = present_classes  # only classes observed in y_tr
     freq = np.array([(y_tr == c).sum() for c in classes], dtype=float)
-    # Avoid division by zero; if class absent set minimal frequency
-    freq = np.where(freq==0, 1e-6, freq)
-    inv = 1.0 / freq
-    class_weights = inv / inv.sum() * len(classes)  # scaled so average weight ~1
-    cw_map = {c: class_weights[i] for i,c in enumerate(classes)}
-    sample_weight = np.array([cw_map[v] for v in y_tr], dtype=float)
+    # Inverse-frequency weights, normalized so average weight ~1 over present classes
+    inv = 1.0 / np.maximum(freq, 1.0)
+    class_weights = inv / inv.mean()
+    cw_map = {int(c): float(w) for c, w in zip(classes, class_weights)}
+    sample_weight = np.array([cw_map.get(int(v), 1.0) for v in y_tr], dtype=float)
     
     
     
@@ -156,7 +156,7 @@ def train_damage(
         eval_metric="mlogloss",
         tree_method=_tree_method(use_gpu),
         random_state=random_state,
-        n_jobs=0,
+        n_jobs=-1,
     )
     # Train without early stopping for broader XGBoost version compatibility
     clf.fit(X_tr, y_tr, sample_weight=sample_weight, eval_set=[(X_te, y_te)], verbose=False)
@@ -232,11 +232,11 @@ def main():
     import argparse
     import sys
 
-    # Auto-run training if no arguments: looks for train_i.csv/test_i.csv in CWD or ./data
+    # Auto-run training if no arguments: looks for train_dmg.csv/test_dmg.csv in CWD or ./data
     if len(sys.argv) == 1:
         candidates = [
-            (os.path.join(os.getcwd(), "train_i.csv"), os.path.join(os.getcwd(), "test_i.csv")),
-            (os.path.join(os.getcwd(), "data", "train_i.csv"), os.path.join(os.getcwd(), "data", "test_i.csv")),
+            (os.path.join(os.getcwd(), "train_dmg.csv"), os.path.join(os.getcwd(), "test_dmg.csv")),
+            (os.path.join(os.getcwd(), "data", "train_dmg.csv"), os.path.join(os.getcwd(), "data", "test_dmg.csv")),
         ]
         for tr, te in candidates:
             if os.path.exists(tr) and os.path.exists(te):
@@ -250,7 +250,7 @@ def main():
                 )
                 print(json.dumps(metrics, indent=2))
                 return
-        print("No arguments and train_i.csv/test_i.csv not found in CWD or ./data.")
+        print("No arguments and train_dmg.csv/test_dmg.csv not found in CWD or ./data.")
 
     parser = argparse.ArgumentParser(description="XGBoost tornado magnitude prediction (training only; inference via risk_inference)")
     sub = parser.add_subparsers(dest="cmd")
