@@ -3,7 +3,6 @@ import { MapContainer, TileLayer, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 
-// Fix for Leaflet default marker icons
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
@@ -11,7 +10,6 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
 
-// Color helper based on risk score
 const getRiskColor = (riskScore) => {
   if (riskScore >= 0.8) return '#8B0000';
   if (riskScore >= 0.6) return '#FF4500';
@@ -20,16 +18,14 @@ const getRiskColor = (riskScore) => {
   return '#00AA00';
 };
 
-// Risk level helper
 const getRiskLevel = (riskScore) => {
   if (riskScore >= 0.8) return 'Critique';
-  if (riskScore >= 0.6) return 'Élevé';
+  if (riskScore >= 0.6) return 'Très élevé';
   if (riskScore >= 0.4) return 'Modéré';
   if (riskScore >= 0.2) return 'Faible';
   return 'Très Faible';
 };
 
-// Component handling map click events
 function MapClickHandler({ onLocationClick }) {
   useMapEvents({
     click(e) {
@@ -40,7 +36,6 @@ function MapClickHandler({ onLocationClick }) {
   return null;
 }
 
-// Component to render risk zones as circle markers
 function RiskCircles({ riskZones }) {
   const map = useMap();
 
@@ -82,7 +77,7 @@ function RiskCircles({ riskZones }) {
               <p style="margin: 0; font-size: 12px; color: #666;">Niveau: ${zone.tornado_damage.toFixed(2)}/10</p>
             </div>
 
-            ${zone.magnitude_probs ? `
+            ${zone.magnitude_probs && zone.magnitude_probs.length > 0 ? `
               <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #e5e5e5;">
                 <p style="margin: 0 0 6px 0; font-weight: 600; font-size: 13px; color: #333;">📊 Distribution EF Scale</p>
                 ${zone.magnitude_probs.map((prob, idx) => `
@@ -114,88 +109,54 @@ export default function App() {
   const [riskZones, setRiskZones] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [apiStatus, setApiStatus] = useState('unknown');
   const mapRef = useRef(null);
   const [mapCenter] = useState([39.8283, -98.5795]);
   const [zoom] = useState(4);
+
+  useEffect(() => {
+    const checkAPI = async () => {
+      try {
+        const response = await fetch('http://localhost:5000/api/health', {
+          headers: { 'Content-Type': 'application/json' },
+        });
+        if (response.ok) {
+          const data = await response.json();
+          setApiStatus(data.ml_available ? 'ready' : 'no-models');
+        } else {
+          setApiStatus('error');
+        }
+      } catch (err) {
+        setApiStatus('offline');
+      }
+    };
+
+    checkAPI();
+  }, []);
 
   const handleLocationClick = async (lat, lng) => {
     setLoading(true);
     setError(null);
 
     try {
-      // SIMULATION DE DONNÉES ML - Remplacer par votre vrai API
-      // const response = await fetch('http://localhost:5000/api/calculate-risk', {
-      //   method: 'POST',
-      //   headers: {
-      //     'Content-Type': 'application/json',
-      //   },
-      //   body: JSON.stringify({
-      //     latitude: lat,
-      //     longitude: lng,
-      //   }),
-      // });
-
-      // if (!response.ok) {
-      //   throw new Error('Erreur lors du calcul du risque');
-      // }
-
-      // const data = await response.json();
-
-      // Calcul du risque avec ML
-      await new Promise(resolve => setTimeout(resolve, 1500)); // Analyse ML
-
-      // Générer des données réalistes avec distribution réaliste
-      // 70% des zones sont à faible risque (vert)
-      const random = Math.random();
-      let riskScore;
-      
-      if (random < 0.70) {
-        // 70% faible risque (0.0 - 0.2) - VERT
-        riskScore = Math.random() * 0.2;
-      } else if (random < 0.85) {
-        // 15% risque modéré (0.2 - 0.4) - JAUNE
-        riskScore = 0.2 + Math.random() * 0.2;
-      } else if (random < 0.95) {
-        // 10% risque élevé (0.4 - 0.6) - ORANGE
-        riskScore = 0.4 + Math.random() * 0.2;
-      } else {
-        // 5% risque critique (0.6 - 1.0) - ROUGE
-        riskScore = 0.6 + Math.random() * 0.4;
-      }
-      
-      const probability = riskScore * 0.8 + Math.random() * 0.1;
-      
-      // Magnitude corrélée au risque
-      let magnitude;
-      if (riskScore < 0.2) {
-        magnitude = Math.random() < 0.8 ? 0 : 1; // Surtout EF0-1
-      } else if (riskScore < 0.4) {
-        magnitude = Math.floor(Math.random() * 3); // EF0-2
-      } else if (riskScore < 0.6) {
-        magnitude = Math.floor(Math.random() * 4); // EF0-3
-      } else {
-        magnitude = Math.floor(Math.random() * 6); // EF0-5
-      }
-      
-      // Distribution de probabilité pour les magnitudes (corrélée)
-      const magnitude_probs = Array(6).fill(0).map((_, idx) => {
-        const distance = Math.abs(idx - magnitude);
-        return Math.exp(-distance * 0.8) * (Math.random() * 0.5 + 0.5);
+      const response = await fetch('http://localhost:5000/api/calculate-risk', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          latitude: lat,
+          longitude: lng,
+        }),
       });
-      const sum = magnitude_probs.reduce((a, b) => a + b, 0);
-      const normalized_probs = magnitude_probs.map(p => p / sum);
-      
-      const tornado_damage = riskScore * 8 + Math.random() * 2;
 
-      const data = {
-        risk_score: riskScore,
-        probability: probability,
-        magnitude: magnitude,
-        magnitude_probs: normalized_probs,
-        tornado_damage: tornado_damage,
-        ef_label: `EF${magnitude}`,
-        risk_level: getRiskLevel(riskScore)
-      };
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `API returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      setApiStatus('ready');
 
       const newZone = {
         id: Date.now(),
@@ -215,7 +176,8 @@ export default function App() {
       setRiskZones([...riskZones, newZone]);
     } catch (err) {
       setError(err.message || 'Erreur lors du calcul du risque');
-      console.error('Erreur:', err);
+      setApiStatus('offline');
+      console.error('Error:', err);
     } finally {
       setLoading(false);
     }
@@ -276,18 +238,56 @@ export default function App() {
         .header-content {
           position: relative;
           z-index: 1;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
         }
 
-        .header h1 {
+        .header-left h1 {
           font-size: 32px;
           font-weight: 800;
           margin-bottom: 8px;
           text-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
 
-        .header p {
+        .header-left p {
           color: rgba(255,255,255,0.9);
           font-size: 15px;
+        }
+
+        .api-status-badge {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          background: rgba(255,255,255,0.2);
+          padding: 8px 14px;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 600;
+        }
+
+        .status-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          animation: pulse 2s infinite;
+        }
+
+        .status-dot.ready {
+          background: #10b981;
+        }
+
+        .status-dot.no-models {
+          background: #f59e0b;
+        }
+
+        .status-dot.offline {
+          background: #ef4444;
+        }
+
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
         }
 
         .main-content {
@@ -639,24 +639,24 @@ export default function App() {
         .leaflet-popup-content {
           margin: 10px;
         }
-
-        .demo-notice {
-          background: rgba(59, 130, 246, 0.2);
-          border: 1px solid rgba(59, 130, 246, 0.4);
-          color: #93c5fd;
-          padding: 12px 16px;
-          border-radius: 8px;
-          font-size: 13px;
-          margin-bottom: 16px;
-          text-align: center;
-          display: none;
-        }
       `}</style>
 
       <div className="header">
         <div className="header-content">
-          <h1>🌍 EarthInsurance Risk Map</h1>
-          <p>Cliquez sur la carte pour analyser le risque de tornade avec ML</p>
+          <div className="header-left">
+            <h1>🌍 EarthInsurance Risk Map</h1>
+            <p>Cliquez sur la carte pour analyser le risque de tornade avec ML</p>
+          </div>
+          <div className="api-status-badge">
+            <div className={`status-dot ${apiStatus}`}></div>
+            <span>
+              {apiStatus === 'ready' && 'API Prête'}
+              {apiStatus === 'no-models' && 'API (pas de modèles)'}
+              {apiStatus === 'offline' && 'Offline'}
+              {apiStatus === 'error' && 'Erreur API'}
+              {apiStatus === 'unknown' && 'Vérification...'}
+            </span>
+          </div>
         </div>
       </div>
 

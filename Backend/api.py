@@ -3,137 +3,45 @@ from flask_cors import CORS
 import numpy as np
 from datetime import datetime
 import traceback
-from embedding_match import get_alphaearth_record as generate_embedding
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    from embedding_match import get_alphaearth_record
+    from risk_inference import predict_damage, predict_probability
+    ML_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"ML modules not available: {e}")
+    ML_AVAILABLE = False
+
 app = Flask(__name__)
 CORS(app)
 
-from risk_inference import predict_damage, predict_probability
-
-# ============================================================================== 
-# TIME CONVERSION UTILITIES
-# ==============================================================================
 
 def convert_to_expected_format(time_str):
-    """
-    Convert an ISO 8601 timestamp to the format expected by the ML models.
-    Expected format: 'YYYY-MM-DD HH:MM:SS+HH:MM'
-    Examples received: '2025-11-09T12:58:57.841038' or '2025-11-09T12:58:57'
-    """
+    """Convert ISO 8601 timestamp to YYYY-MM-DD HH:MM:SS+HH:MM format."""
+    if not time_str:
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
+    
     try:
-        # Parse the ISO timestamp
         if 'T' in time_str:
-            # Drop microseconds if present
             if '.' in time_str:
                 time_str = time_str.split('.')[0]
-            
-            # Parse the date
             dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
         else:
-            # If already in the right format or a custom format
-            dt = datetime.strptime(time_str.split('+')[0].split('-')[0:3][0] + '-' + 
-                                  time_str.split('+')[0].split('-')[1] + '-' + 
-                                  time_str.split('+')[0].split('-')[2].split(' ')[0] + ' ' +
-                                  time_str.split(' ')[1].split('+')[0], 
-                                  '%Y-%m-%d %H:%M:%S')
+            dt = datetime.fromisoformat(time_str.split('+')[0])
         
-        # Convert to expected format: 'YYYY-MM-DD HH:MM:SS+00:00'
-        formatted_time = dt.strftime('%Y-%m-%d %H:%M:%S+00:00')
-        return formatted_time
+        return dt.strftime('%Y-%m-%d %H:%M:%S+00:00')
     
     except Exception as e:
-        print(f"Timestamp conversion error: {e}")
-        # Fallback: return current timestamp in the expected format
+        logger.error(f"Timestamp conversion error: {e}")
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
 
 
-# ==============================================================================
-# UTILITAIRES POUR PARSER LES RÉSULTATS ML
-# ==============================================================================
-
-def parse_probability_result(result):
-    """
-    Parse le résultat de predict_probability quel que soit son format.
-    Retourne: (probability, magnitude, magnitude_probs)
-    """
-    try:
-        # Cas 1: C'est un dictionnaire avec toutes les infos
-        if isinstance(result, dict):
-            return (
-                float(result.get('probability', 0.0)),
-                int(result.get('magnitude', 0)),
-                [float(p) for p in result.get('magnitude_probs', [0.0] * 6)]
-            )
-        
-        # Cas 2: C'est un tuple (probability, magnitude, probs)
-        elif isinstance(result, tuple) and len(result) >= 3:
-            return (
-                float(result[0]),
-                int(result[1]),
-                [float(p) for p in result[2]]
-            )
-        
-        # Cas 3: C'est un tuple (probability, magnitude)
-        elif isinstance(result, tuple) and len(result) == 2:
-            return (
-                float(result[0]),
-                int(result[1]),
-                [0.0] * 6
-            )
-        
-        # Cas 4: C'est juste une probabilité (float)
-        elif isinstance(result, (int, float)):
-            return (float(result), 0, [0.0] * 6)
-        
-        # Cas 5: Résultat inattendu
-        else:
-            print(f"Format de résultat inattendu pour predict_probability: {type(result)}")
-            return (0.0, 0, [0.0] * 6)
-            
-    except Exception as e:
-        print(f"Erreur lors du parsing du résultat de probabilité: {e}")
-        traceback.print_exc()
-        return (0.0, 0, [0.0] * 6)
-
-
-def parse_damage_result(result):
-    """
-    Parse le résultat de predict_damage quel que soit son format.
-    Retourne: tornado_damage (float)
-    """
-    try:
-        # Cas 1: C'est un dictionnaire
-        if isinstance(result, dict):
-            return float(result.get('tornado_magnitude', 0.0))
-        
-        # Cas 2: C'est directement une valeur numérique
-        elif isinstance(result, (int, float)):
-            return float(result)
-        
-        # Cas 3: C'est un tuple, prendre le premier élément
-        elif isinstance(result, tuple) and len(result) > 0:
-            return float(result[0])
-        
-        # Cas 4: Résultat inattendu
-        else:
-            print(f"Format de résultat inattendu pour predict_damage: {type(result)}")
-            return 0.0
-            
-    except Exception as e:
-        print(f"Erreur lors du parsing du résultat de dégâts: {e}")
-        traceback.print_exc()
-        return 0.0
-
-
-# ============================================================================== 
-# RISK CALCULATION WITH ML
-# ==============================================================================
-
-
-
 def get_risk_level(risk_score):
-    """
-    Map a continuous risk score to a human-readable label.
-    """
+    """Map continuous risk score to human-readable label."""
     if risk_score >= 0.8:
         return 'Critique'
     elif risk_score >= 0.6:
@@ -147,9 +55,7 @@ def get_risk_level(risk_score):
 
 
 def get_ef_scale_label(magnitude):
-    """
-    Convert an EF-scale magnitude to a descriptive label.
-    """
+    """Convert EF-scale magnitude to descriptive label."""
     labels = {
         0: 'EF0 - Dégâts légers',
         1: 'EF1 - Dégâts modérés',
@@ -158,77 +64,132 @@ def get_ef_scale_label(magnitude):
         4: 'EF4 - Dégâts dévastateurs',
         5: 'EF5 - Dégâts incroyables',
     }
-    return labels.get(magnitude, 'Inconnu')
+    return labels.get(int(magnitude), 'Inconnu')
 
 
 def calculate_risk_from_ml_models(latitude, longitude, time_utc=None):
-    """
-    Use the ML models to predict tornado risk.
+    """Use ML models to predict tornado risk.
     
-    Returns:
-    - probability: occurrence probability (0–1)
-    - magnitude: predicted EF-scale class (0–5)
-    - magnitude_probs: probability distribution over EF classes
-    - damage: damage proxy estimate (tornado_magnitude)
+    Returns dict with risk metrics.
     """
-    # If no timestamp provided, use current time (formatted)
+    
+    if not ML_AVAILABLE:
+        logger.error("ML models not available")
+        raise RuntimeError("ML inference engine not initialized")
+    
     if time_utc is None:
         time_utc = datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
     else:
-        # Convert timestamp to expected format
         time_utc = convert_to_expected_format(time_utc)
     
-    # Generate embedding
-    embedding = generate_embedding(latitude, longitude, time_utc)
-    
-    # Prédire la probabilité et la magnitude
     try:
-        print(f"Appel predict_probability pour lat={latitude}, lon={longitude}")
-        prob_result = predict_probability(
-            embedding=embedding,
+        logger.info(f"Generating embedding for lat={latitude}, lon={longitude}, time={time_utc}")
+        embedding = get_alphaearth_record(latitude, longitude, time_utc)
+        logger.info(f"Embedding generated: shape={len(embedding['embedding'])}")
+        
+    except Exception as e:
+        logger.error(f"Error generating embedding: {e}")
+        raise RuntimeError(f"Failed to generate embedding: {str(e)}")
+    
+    try:
+        logger.info("Calling predict_probability")
+        probability, magnitude, magnitude_probs = predict_probability(
+            embedding=embedding['embedding'],
             lat=latitude,
             lon=longitude,
             time_utc=time_utc,
             model_prob_dir="models_prob"
         )
-        print(f"Résultat brut predict_probability: {prob_result} (type: {type(prob_result)})")
-        
-        probability, magnitude, magnitude_probs = parse_probability_result(prob_result)
-        print(f"Résultat parsé: prob={probability}, mag={magnitude}, probs={magnitude_probs}")
+        logger.info(f"Probability prediction: prob={probability}, mag={magnitude}")
         
     except Exception as e:
-        print(f"Error during probability prediction: {e}")
-        probability = 0.0
-        magnitude = 0
-        magnitude_probs = [0.0] * 6
+        logger.error(f"Error during probability prediction: {e}")
+        probability, magnitude, magnitude_probs = 0.0, 0, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     
-    # Predict damage proxy
     try:
-        print(f"Appel predict_damage pour lat={latitude}, lon={longitude}")
-        damage_result = predict_damage(
-            embedding=embedding,
+        logger.info("Calling predict_damage")
+        tornado_damage = predict_damage(
+            embedding=embedding['embedding'],
             lat=latitude,
             lon=longitude,
             time_utc=time_utc,
             model_damage_dir="models_damage"
         )
-        print(f"Résultat brut predict_damage: {damage_result} (type: {type(damage_result)})")
-        
-        tornado_damage = parse_damage_result(damage_result)
-        print(f"Résultat parsé: damage={tornado_damage}")
+        logger.info(f"Damage prediction: damage={tornado_damage}")
         
     except Exception as e:
-        print(f"Error during damage prediction: {e}")
+        logger.error(f"Error during damage prediction: {e}")
         tornado_damage = 0.0
     
-    # Compute combined risk score
-    # Risk = Probability × (Magnitude/5) × (1 + Damage/10)
-    normalized_magnitude = magnitude / 5.0 if magnitude > 0 else 0.1
-    damage_factor = 1 + (tornado_damage / 10.0)
-    risk_score = probability * normalized_magnitude * damage_factor
+    # Risk score = fonction pondérée des magnitudes avec accent brutal sur les grosses
+    # Différenciation drastique entre dangereux et pas dangereux
+    
+    damage_score_norm = float(tornado_damage / 10.0)  # 0-1 (normalize damage)
+    
+    # Fonction pondérée avec accent sur les grosses magnitudes
+    if magnitude_probs and len(magnitude_probs) > 0:
+        n_classes = len(magnitude_probs)
+        # Créer les poids basés sur la taille réelle (2^0, 2^1, 2^2, ...)
+        weights = np.array([2.0**i for i in range(n_classes)], dtype=float)
+        weighted_probs = np.array(magnitude_probs, dtype=float) * weights
+        weighted_probs = weighted_probs / (weighted_probs.sum() + 1e-8)  # renormaliser
+        
+        # Magnitude pondérée accentuée
+        expected_magnitude_accentuated = sum(i * p for i, p in enumerate(weighted_probs))
+        expected_mag_score = float(expected_magnitude_accentuated / (n_classes - 1)) if n_classes > 1 else 0.0
+        
+        # Calculer la probabilité d'EF1 ou plus (index >= 1)
+        prob_ef1_plus = sum(magnitude_probs[i] for i in range(1, len(magnitude_probs)))
+    else:
+        mag_score = float(magnitude / 5.0)
+        expected_mag_score = mag_score
+        expected_magnitude_accentuated = magnitude
+        prob_ef1_plus = 0.0
+    
+    # Fonction sigmoïde brutale pour différencier dangereux vs pas dangereux
+    # Si mag_score < 0.3 → risque très faible (< 0.15)
+    # Si mag_score >= 0.3 → risque monte rapidement
+    if expected_mag_score < 0.15:
+        # EF0 pur: TRÈS faible
+        base_risk = 0.02
+        risk_multiplier = 1.0
+    elif expected_mag_score < 0.25:
+        # Borderline EF0-EF1: faible
+        base_risk = 0.08
+        risk_multiplier = 1.1
+    elif expected_mag_score < 0.35:
+        # EF1 léger: modéré-bas
+        base_risk = 0.25
+        risk_multiplier = 1.5
+    elif expected_mag_score < 0.5:
+        # EF1-EF2 mix: modéré
+        base_risk = 0.45
+        risk_multiplier = 2.0
+    elif expected_mag_score < 0.65:
+        # EF2 dominant: élevé
+        base_risk = 0.60
+        risk_multiplier = 2.5
+    elif expected_mag_score < 0.75:
+        # EF3 dominant: très élevé
+        base_risk = 0.75
+        risk_multiplier = 3.0
+    else:
+        # EF4-5 dominant: CRITIQUE
+        base_risk = 0.85
+        risk_multiplier = 3.5
+    
+    risk_score = base_risk * risk_multiplier
+    
+    # BOOST BRUTAL si prob(EF1+) > 30%
+    if prob_ef1_plus > 0.30:
+        # Augmenter drastiquement
+        risk_score = risk_score * 2.5  # Multiplier par 2.5
+        logger.info(f"BOOST APPLIED: prob_ef1_plus={prob_ef1_plus:.2%} > 30%")
+    
+    # Clamp final à 0-1
     risk_score = float(np.clip(risk_score, 0, 1))
     
-    print(f"Score de risque final: {risk_score}")
+    logger.info(f"Final risk score: {risk_score} (mag_accentuated={expected_magnitude_accentuated:.2f}, mag_score={expected_mag_score:.2f}, prob_ef1+={prob_ef1_plus:.2%}, damage={tornado_damage:.2f})")
     
     return {
         'risk_score': risk_score,
@@ -240,44 +201,41 @@ def calculate_risk_from_ml_models(latitude, longitude, time_utc=None):
     }
 
 
-# ============================================================================== 
-# API ROUTES
-# ==============================================================================
-
 @app.route('/api/health', methods=['GET'])
 def health():
-    """
-    Simple health check endpoint to confirm the server is running.
-    """
-    return jsonify({'status': 'ok', 'message': 'EarthInsurance backend running'}), 200
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'ok',
+        'message': 'EarthInsurance backend running',
+        'ml_available': ML_AVAILABLE
+    }), 200
 
 
 @app.route('/api/calculate-risk', methods=['POST'])
 def calculate_risk():
-    """
-    Endpoint to compute tornado risk using ML models.
-    
-    Input (JSON POST):
-    {
-        "latitude": 35.4676,
-        "longitude": -97.5164,
-        "time_utc": "2025-05-02 14:30:00+00:00" (optional)
-    }
-    """
+    """Compute tornado risk using ML models."""
     try:
         data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Empty request body'}), 400
+        
         latitude = data.get('latitude')
         longitude = data.get('longitude')
-        time_utc = data.get('time_utc')  # Optional
+        time_utc = data.get('time_utc')
         
-        # Validation
         if latitude is None or longitude is None:
-            return jsonify({'error': 'Latitude et longitude requis'}), 400
+            return jsonify({'error': 'latitude and longitude are required'}), 400
+        
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (ValueError, TypeError):
+            return jsonify({'error': 'latitude and longitude must be numbers'}), 400
         
         if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-            return jsonify({'error': 'Coordonnées invalides'}), 400
+            return jsonify({'error': 'Invalid coordinates (lat: -90 to 90, lon: -180 to 180)'}), 400
         
-        # Compute with ML models
         ml_result = calculate_risk_from_ml_models(latitude, longitude, time_utc)
         
         return jsonify({
@@ -291,72 +249,87 @@ def calculate_risk():
             'latitude': latitude,
             'longitude': longitude,
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00'),
-            'model_info': 'ML-based tornado risk prediction using AlphaEarth embeddings',
+            'model_info': 'ML-based tornado risk prediction using AlphaEarth embeddings'
         }), 200
     
     except Exception as e:
-        print(f"Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error in /api/calculate-risk: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/batch-calculate-risk', methods=['POST'])
 def batch_calculate_risk():
-    """
-    Endpoint to compute risks for multiple locations.
-    
-    Input (JSON POST):
-    {
-        "locations": [
-            {"latitude": 35.47, "longitude": -97.52},
-            {"latitude": 40.71, "longitude": -74.01}
-        ]
-    }
-    """
+    """Compute risks for multiple locations."""
     try:
         data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Empty request body'}), 400
+        
         locations = data.get('locations', [])
         
         if not locations:
-            return jsonify({'error': 'Aucune localisation fournie'}), 400
+            return jsonify({'error': 'locations array is required'}), 400
+        
+        if not isinstance(locations, list):
+            return jsonify({'error': 'locations must be an array'}), 400
         
         results = []
-        for loc in locations:
-            lat = loc.get('latitude')
-            lng = loc.get('longitude')
-            
-            if lat is not None and lng is not None:
+        
+        for idx, loc in enumerate(locations):
+            try:
+                lat = loc.get('latitude')
+                lng = loc.get('longitude')
+                
+                if lat is None or lng is None:
+                    results.append({
+                        'index': idx,
+                        'error': 'latitude and longitude are required'
+                    })
+                    continue
+                
                 try:
-                    ml_result = calculate_risk_from_ml_models(lat, lng)
+                    lat = float(lat)
+                    lng = float(lng)
+                except (ValueError, TypeError):
                     results.append({
-                        'latitude': lat,
-                        'longitude': lng,
-                        'risk_score': ml_result['risk_score'],
-                        'risk_level': get_risk_level(ml_result['risk_score']),
-                        'probability': ml_result['probability'],
-                        'magnitude': ml_result['magnitude'],
-                        'ef_label': ml_result['ef_label'],
+                        'index': idx,
+                        'error': 'latitude and longitude must be numbers'
                     })
-                except Exception as e:
-                    print(f"Error for location ({lat}, {lng}): {e}")
-                    results.append({
-                        'latitude': lat,
-                        'longitude': lng,
-                        'error': str(e),
-                    })
+                    continue
+                
+                ml_result = calculate_risk_from_ml_models(lat, lng)
+                
+                results.append({
+                    'index': idx,
+                    'latitude': lat,
+                    'longitude': lng,
+                    'risk_score': ml_result['risk_score'],
+                    'risk_level': get_risk_level(ml_result['risk_score']),
+                    'probability': ml_result['probability'],
+                    'magnitude': ml_result['magnitude'],
+                    'magnitude_probs': ml_result['magnitude_probs'],
+                    'tornado_damage': ml_result['tornado_damage'],
+                    'ef_label': ml_result['ef_label'],
+                })
+            
+            except Exception as e:
+                logger.error(f"Error processing location {idx}: {e}")
+                results.append({
+                    'index': idx,
+                    'error': str(e)
+                })
         
         return jsonify({'results': results}), 200
     
     except Exception as e:
+        logger.error(f"Error in /api/batch-calculate-risk: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/risk-zones', methods=['GET'])
 def get_predefined_zones():
-    """
-    Return predefined risk zones with ML-derived risk metrics.
-    """
+    """Return predefined risk zones with ML-derived risk metrics."""
     zones = [
         {
             'name': 'Tornado Alley (Oklahoma)',
@@ -378,81 +351,54 @@ def get_predefined_zones():
         },
     ]
     
-    # Compute risk for each zone
     for zone in zones:
         try:
             ml_result = calculate_risk_from_ml_models(
-                zone['latitude'], 
+                zone['latitude'],
                 zone['longitude']
             )
             zone['risk_score'] = ml_result['risk_score']
             zone['risk_level'] = get_risk_level(ml_result['risk_score'])
             zone['probability'] = ml_result['probability']
             zone['magnitude'] = ml_result['magnitude']
+            zone['magnitude_probs'] = ml_result['magnitude_probs']
+            zone['tornado_damage'] = ml_result['tornado_damage']
             zone['ef_label'] = ml_result['ef_label']
+        
         except Exception as e:
-            print(f"Error computing risk for {zone['name']}: {e}")
+            logger.error(f"Error computing risk for {zone['name']}: {e}")
             zone['risk_score'] = 0.0
             zone['risk_level'] = 'Inconnu'
+            zone['error'] = str(e)
     
     return jsonify({'zones': zones}), 200
 
 
 @app.route('/api/predict-detailed', methods=['POST'])
 def predict_detailed():
-    """
-    Detailed endpoint returning all available ML model outputs.
-    
-    Input (JSON POST):
-    {
-        "latitude": 35.4676,
-        "longitude": -97.5164,
-        "time_utc": "2025-05-02 14:30:00+00:00" (optional)
-    }
-    """
+    """Detailed endpoint returning all ML model outputs."""
     try:
         data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Empty request body'}), 400
+        
         latitude = data.get('latitude')
         longitude = data.get('longitude')
         time_utc = data.get('time_utc')
         
         if latitude is None or longitude is None:
-            return jsonify({'error': 'Latitude et longitude requis'}), 400
+            return jsonify({'error': 'latitude and longitude are required'}), 400
+        
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (ValueError, TypeError):
+            return jsonify({'error': 'latitude and longitude must be numbers'}), 400
         
         if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-            return jsonify({'error': 'Coordonnées invalides'}), 400
+            return jsonify({'error': 'Invalid coordinates'}), 400
         
-        # Convert timestamp to expected format if provided
-        if time_utc is None:
-            time_utc = datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00')
-        else:
-            time_utc = convert_to_expected_format(time_utc)
-        
-        # Generate embedding
-        embedding = generate_embedding(latitude, longitude, time_utc)
-        
-        # ML predictions
-        prob_result = predict_probability(
-            embedding=embedding,
-            lat=latitude,
-            lon=longitude,
-            time_utc=time_utc,
-            model_prob_dir="models_prob"
-        )
-        
-        damage_result = predict_damage(
-            embedding=embedding,
-            lat=latitude,
-            lon=longitude,
-            time_utc=time_utc,
-            model_damage_dir="models_damage"
-        )
-        
-        # Parser les résultats
-        probability, magnitude, magnitude_probs = parse_probability_result(prob_result)
-        tornado_magnitude = parse_damage_result(damage_result)
-        
-        # Combined result
         ml_result = calculate_risk_from_ml_models(latitude, longitude, time_utc)
         
         return jsonify({
@@ -460,15 +406,15 @@ def predict_detailed():
                 'latitude': latitude,
                 'longitude': longitude,
             },
-            'timestamp': time_utc,
+            'timestamp': time_utc or datetime.now().strftime('%Y-%m-%d %H:%M:%S+00:00'),
             'probability_prediction': {
-                'probability': probability,
-                'magnitude': magnitude,
-                'magnitude_probs': magnitude_probs,
-                'ef_label': get_ef_scale_label(magnitude),
+                'probability': ml_result['probability'],
+                'magnitude': ml_result['magnitude'],
+                'magnitude_probs': ml_result['magnitude_probs'],
+                'ef_label': ml_result['ef_label'],
             },
             'damage_prediction': {
-                'tornado_magnitude': tornado_magnitude,
+                'tornado_magnitude': ml_result['tornado_damage'],
             },
             'combined_risk': {
                 'risk_score': ml_result['risk_score'],
@@ -477,20 +423,28 @@ def predict_detailed():
         }), 200
     
     except Exception as e:
-        print(f"Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error in /api/predict-detailed: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
-# ============================================================================== 
-# SERVER STARTUP
-# ==============================================================================
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f"Internal server error: {error}")
+    return jsonify({'error': 'Internal server error'}), 500
+
 
 if __name__ == '__main__':
     print("🚀 Starting EarthInsurance server…")
     print("📍 API available at http://localhost:5000")
     print("✅ CORS enabled")
-    print("🤖 ML models loaded")
+    if ML_AVAILABLE:
+        print("🤖 ML models loaded")
+    else:
+        print("⚠️  ML models NOT loaded (install dependencies)")
     print("📡 Waiting for requests…")
     app.run(debug=True, port=5000, host='0.0.0.0')

@@ -6,9 +6,9 @@ Now supports:
 
 Usage example:
     from risk_inference import predict_probability, predict_damage, predict_all
-    p = predict_probability(embedding, lat, lon, time_utc)  # float in [0,1]
-    d = predict_damage(embedding, lat, lon, time_utc)       # {"magnitude_probs": [...]} or legacy magnitude
-    all_res = predict_all(embedding, lat, lon, time_utc)    # merged dict
+    p, mag, mag_probs = predict_probability(embedding, lat, lon, time_utc)  
+    d = predict_damage(embedding, lat, lon, time_utc)       
+    all_res = predict_all(embedding, lat, lon, time_utc)    
 
 Inputs:
     - embedding: list[float] length 64
@@ -30,7 +30,6 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier, XGBRegressor
 import xgboost as xgb
-from embedding_match import get_alphaearth_record
 
 EMBEDDING_DIM = 64
 STRICT_FORMAT = "%Y-%m-%d %H:%M:%S%z"  # kept for backward compat (space variant)
@@ -192,32 +191,70 @@ def predict_probability(
     lon: float,
     time_utc: Union[str, datetime],
     model_prob_dir: str = "models_prob",
-) -> float:
+) -> Tuple[float, int, List[float]]:
+    """Predict tornado probability and load magnitude distribution.
+    
+    Returns: (probability, magnitude_class, magnitude_probs)
+    """
     clf, feature_names = _load_prob(model_prob_dir)
     X = _build_row(embedding, lat, lon, time_utc).reindex(columns=feature_names, fill_value=0.0)
-    # Prefer using the Booster directly (robust after load_model), fallback to sklearn predict_proba
+    
+    # Get probability
     try:
         booster = clf.get_booster()
         dmat = xgb.DMatrix(X)
         pred = booster.predict(dmat)
-        # binary:logistic -> (n_samples,) or (n_samples, 1); if unexpected 2D with >1, take class 1
         if isinstance(pred, np.ndarray):
             if pred.ndim == 2:
                 if pred.shape[1] == 1:
-                    return float(pred[0, 0])
-                return float(pred[0, 1])
-            return float(pred[0])
-        return float(np.asarray(pred).ravel()[0])
+                    probability = float(pred[0, 0])
+                else:
+                    probability = float(pred[0, 1])
+            else:
+                probability = float(pred[0])
+        else:
+            probability = float(np.asarray(pred).ravel()[0])
     except Exception:
-        # Some xgboost versions lose sklearn wrapper attrs after load_model; set minimal attrs to enable predict_proba
         if not hasattr(clf, "n_classes_"):
             clf.n_classes_ = 2
         if not hasattr(clf, "classes_"):
             clf.classes_ = np.array([0, 1], dtype=np.int64)
-        return float(clf.predict_proba(X)[:, 1][0])
-
-
-
+        probability = float(clf.predict_proba(X)[:, 1][0])
+    
+    # Get magnitude distribution
+    try:
+        model, feature_names_mag, class_labels, model_type = _load_magnitude()
+        X_mag = _build_row(embedding, lat, lon, time_utc).reindex(columns=feature_names_mag, fill_value=0.0)
+        
+        if model_type == "cls":
+            try:
+                probs = np.asarray(model.predict_proba(X_mag))[0]
+            except Exception:
+                booster_mag = model.get_booster()
+                proba = booster_mag.predict(xgb.DMatrix(X_mag))
+                probs = np.asarray(proba)[0]
+        else:
+            # legacy regression
+            try:
+                booster_mag = model.get_booster()
+                mag_val = float(np.asarray(booster_mag.predict(xgb.DMatrix(X_mag))).ravel()[0])
+            except Exception:
+                mag_val = float(np.asarray(model.predict(X_mag)).ravel()[0])
+            
+            k = np.arange(len(class_labels), dtype=float)
+            sigma = 0.85
+            weights = np.exp(-0.5 * ((k - mag_val) / max(sigma, 1e-6))**2)
+            probs = weights / weights.sum() if weights.sum() > 0 else weights
+        
+        probs = probs / probs.sum() if probs.sum() > 0 else probs
+        magnitude_class = int(np.argmax(probs))
+        magnitude_probs = [float(p) for p in probs.tolist()]
+        
+    except Exception as e:
+        magnitude_class = 0
+        magnitude_probs = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    
+    return (probability, magnitude_class, magnitude_probs)
 
 
 def predict_damage(
@@ -226,30 +263,42 @@ def predict_damage(
     lon: float,
     time_utc: Union[str, datetime],
     model_damage_dir: str = "models_damage",
-) -> Dict[str, float]:
+) -> float:
+    """Predict tornado damage score (0-10).
+    
+    Returns: damage_score (float)
+    """
     model, feature_names, class_labels, model_type = _load_magnitude(model_damage_dir)
     X = _build_row(embedding, lat, lon, time_utc).reindex(columns=feature_names, fill_value=0.0)
+    
     if model_type == "cls":
-        # Prefer sklearn wrapper predict_proba to avoid potential DMatrix feature alignment quirks
         try:
             probs = np.asarray(model.predict_proba(X))[0]
         except Exception:
-            booster = model.get_booster(); proba = booster.predict(xgb.DMatrix(X))
+            booster = model.get_booster()
+            proba = booster.predict(xgb.DMatrix(X))
             probs = np.asarray(proba)[0]
+        
         probs = probs / probs.sum() if probs.sum() > 0 else probs
-        return {"magnitude_probs": [float(p) for p in probs.tolist()]}
-    # legacy regression fallback -> smooth probabilistic distribution around predicted magnitude
-    try:
-        booster = model.get_booster(); mag_val = float(np.asarray(booster.predict(xgb.DMatrix(X))).ravel()[0])
-    except Exception:
-        mag_val = float(np.asarray(model.predict(X)).ravel()[0])
-    # Gaussian smoothing across discrete classes
-    k = np.arange(len(class_labels), dtype=float)
-    sigma = 0.85  # spread; tune if needed
-    weights = np.exp(-0.5 * ((k - mag_val) / max(sigma, 1e-6))**2)
-    probs = weights / weights.sum() if weights.sum() > 0 else weights
-    mag_cls = int(np.clip(np.argmax(probs), 0, len(class_labels)-1))
-    return {"magnitude_probs": [float(p) for p in probs.tolist()], "magnitude": float(mag_cls)}
+        magnitude = np.argmax(probs)
+        # Map magnitude (0-5) to damage (0-10) with better scaling
+        damage_score = float((magnitude / 5.0) * 10.0)
+        # Add probability weighting from the distribution
+        expected_magnitude = float(np.sum(np.arange(len(probs)) * probs))
+        damage_score = float((expected_magnitude / 5.0) * 10.0)
+        
+    else:
+        # legacy regression
+        try:
+            booster = model.get_booster()
+            mag_val = float(np.asarray(booster.predict(xgb.DMatrix(X))).ravel()[0])
+        except Exception:
+            mag_val = float(np.asarray(model.predict(X)).ravel()[0])
+        
+        # Map regression output (usually 0-5) to damage (0-10)
+        damage_score = float(np.clip(mag_val * 2.0, 0, 10))
+    
+    return damage_score
 
 
 def predict_all(
@@ -260,25 +309,25 @@ def predict_all(
     model_prob_dir: str = "models_prob",
     model_damage_dir: str = "models_damage",
 ) -> Dict[str, float]:
-    p = predict_probability(embedding, lat, lon, time_utc, model_prob_dir)
-    out: Dict[str, float] = {"probability": p}
-    try:
-        d = predict_damage(embedding, lat, lon, time_utc, model_damage_dir)
-        out.update(d)
-        if "magnitude_probs" in d:
-            probs = np.asarray(d["magnitude_probs"]).ravel()
-            if probs.size > 0:
-                out["magnitude"] = int(np.argmax(probs))
-    except Exception:
-        pass
-    return out
-
-
-
+    """Predict all metrics at once.
+    
+    Returns: dict with probability, magnitude, magnitude_probs, tornado_damage
+    """
+    probability, magnitude, magnitude_probs = predict_probability(embedding, lat, lon, time_utc, model_prob_dir)
+    damage = predict_damage(embedding, lat, lon, time_utc, model_damage_dir)
+    
+    return {
+        "probability": probability,
+        "magnitude": magnitude,
+        "magnitude_probs": magnitude_probs,
+        "tornado_damage": damage,
+    }
 
 
 def manual_example():  # pragma: no cover (optional helper)
-    embedding=get_alphaearth_record(
+    from embedding_match import get_alphaearth_record
+    
+    embedding = get_alphaearth_record(
         lat=37.43685,
         lon=-91.9,
         when="2023-05-02"
@@ -291,5 +340,5 @@ def manual_example():  # pragma: no cover (optional helper)
         "result": res
     })
 
-if __name__ == "__main__":  # only run when executed directly, not on import
+if __name__ == "__main__":
     manual_example()
