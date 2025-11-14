@@ -28,6 +28,7 @@ Tornado risk prediction with XGBoost using AlphaEarth embeddings, contextual spa
   - Check: open `http://localhost:5000/api/health`
 
 - Frontend (React + Vite)
+  - `rm -r node_modules package-lock.json` (clean packages) 
   - `cd Frontend`
   - `npm install`
   - `npm run dev`
