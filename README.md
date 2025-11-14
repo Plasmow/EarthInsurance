@@ -2,6 +2,16 @@
 
 Tornado risk prediction with XGBoost using AlphaEarth embeddings, contextual spatiotemporal features and risk features(occurence and magnitude with FEMA dataset). Ships a Flask API and a React + Leaflet map UI.
 
+## Demo images
+
+<!-- Gallery (responsive) -->
+<p align="center">
+  <img src="demo_images/miami.png" alt="Miami prediction" width="320"/>
+  <img src="demo_images/other.png" alt="Other predictions" width="320"/>
+</p>
+
+
+
 ## Quickstart
 
 - Python deps
@@ -14,13 +24,14 @@ Tornado risk prediction with XGBoost using AlphaEarth embeddings, contextual spa
   - Quick test (prints a 64-d vector): `python Backend/model.py`
 
 - Backend (Flask)
-  - `python Backend/api.py`
+  - `python Backend/api.py` or `py Backend/api.py`
   - Check: open `http://localhost:5000/api/health`
 
 - Frontend (React + Vite)
-  - `cd Frontend && npm install`
+  - `cd Frontend`
+  - `npm install`
   - `npm run dev`
-  - Open the shown URL (e.g., `http://localhost:5173`) and click on the map. Backend defaults to `http://localhost:5000`.
+  - Open the shown URL and click on the map. Backend defaults to `http://localhost:3000/`.
 
 ## What It Does
 
@@ -75,6 +86,10 @@ CSV schema: `lat, lon, time_utc, f1..f64` (+ `??` for probability, `??` for magn
 - `embedding_match.py`: Helper to return a standardized `{embedding, lat, lon, time_utc}` record from AlphaEarth for a lat/lon/date.
 - `extract_alphaearth_local.py`: Local‑only AlphaEarth extractor; samples yearly embeddings and saves to CSV with paged downloads.
 - `Backend/extract_alphaearth_local.py`: Variant of the local AlphaEarth extractor scoped to the Backend folder.
+
+
+## To improve
+ -Improve the probability model as it is very simple (8MB of weight)
 
 ## Troubleshooting
 
