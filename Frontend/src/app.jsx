@@ -67,8 +67,7 @@ function RiskCircles({ riskZones }) {
             </div>
 
             <div style="margin-bottom: 12px;">
-              <p style="margin: 0 0 6px 0; font-weight: 600; font-size: 13px; color: #333;">⚠️ Probabilité & Magnitude</p>
-              <p style="margin: 0; font-size: 12px; color: #666;">Probabilité: ${(zone.probability * 100).toFixed(1)}%</p>
+              <p style="margin: 0 0 6px 0; font-weight: 600; font-size: 13px; color: #333;">⚠️  Magnitude</p>
               <p style="margin: 0; font-size: 12px; color: #666;">Magnitude: ${zone.ef_label}</p>
             </div>
 
@@ -730,12 +729,6 @@ export default function App() {
                       <span className="zone-detail-label">📍 Position</span>
                       <span className="zone-detail-value">
                         {zone.lat.toFixed(4)}°, {zone.lng.toFixed(4)}°
-                      </span>
-                    </div>
-                    <div className="zone-detail-row">
-                      <span className="zone-detail-label">⚠️ Probabilité</span>
-                      <span className="zone-detail-value">
-                        {(zone.probability * 100).toFixed(1)}%
                       </span>
                     </div>
                     <div className="zone-detail-row">
